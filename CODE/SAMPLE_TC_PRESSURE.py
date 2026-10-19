@@ -245,16 +245,27 @@ def _sample_truncated_twopn(mu, std_neg, std_pos, lower, upper):
 # ==========================================================================
 
 
-def Calculate_Vmax(Penv, Pc, coef):
+def Calculate_Vmax_old(Penv, Pc, coef):
     [a, b] = coef
     Vmax10 = a * (Penv - Pc) ** b
     return Vmax10
 
+def Calculate_Vmax(Penv, Pc, lat, coef):
+    """New function to convert Pressure deficit to Vmax."""
+    [a, b_pressure , b_lat] = coef
+    Vmax10 = a * (Penv - Pc) ** b_pressure * np.exp(b_lat * (np.abs(lat) - 20) / 10) 
+    return Vmax10
 
-def Calculate_Pressure(Vmax10, Penv, coef):
+
+def Calculate_Pressure_old(Vmax10, Penv, coef):
     [a, b] = coef
     Pc = Penv - (Vmax10 / a) ** (1.0 / b)
     return Pc
+
+def Calculate_Pressure(Vmax10, Penv, lat, coef):
+    [a, b_pressure , b_lat] = coef
+    Pc = Penv - ((Vmax10 / a)  * np.exp(- b_lat * (np.abs(lat) - 20) / 10)) ** (1/b_pressure)
+    return Pc 
 
 
 def TC_Category(V):
@@ -371,6 +382,12 @@ def decay_after_landfall(lat_landfall, lon_landfall, latlijst, lonlijst, p, coef
             v = -100.0
 
     return pressure_decay, wind_decay
+
+
+def decay_after_landfall_env(lat_landfall, lon_landfall, latlist, lonlist, p, coef, Penv):
+
+
+
 
 def add_parameters_to_TC_data(
     pressure_list,

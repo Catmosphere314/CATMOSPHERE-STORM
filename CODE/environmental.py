@@ -251,17 +251,6 @@ def check_season(idx, month):
     return check
 
 
-def Vmax_function(DP, A, B):
-    """
-    This is the wind-pressure relationship. Here, we calculate the values of the coefficients
-    A en B for the wind and pressure found in the dataset.
-    Parameters
-    ----------
-    DP : Difference between environmental pressure and central pressure (hPa)
-    A,B : Coefficients for wind-pressure relationship.
-    """
-    return A * (DP) ** B
-
 
 def wind_pressure_relationship(idx_basin, months):
     """
@@ -291,17 +280,20 @@ def wind_pressure_relationship(idx_basin, months):
     ).item()
     basinlist = np.load(
         os.path.join(__location__, "BASINLIST_INTERP.npy"), allow_pickle=True
+    ).item()    
+    timelist = np.load(
+        os.path.join(__location__, "TIMELIST_INTERP.npy"), allow_pickle=True
     ).item()
 
-    data = xr.open_dataset(os.path.join(__location__, "Monthly_mean_SST.nc"))
+    mslp = xr.open_dataset(os.path.join(__location__, "Monthly_mean_MSLP.nc"))
 
-    lon = data.longitude.values
-    lat = data.latitude.values
-    data.close()
+    lon = mslp.longitude.values
+    lat = mslp.latitude.values
 
     pres_basin = {i: [] for i in range(0, 6)}
     wind_basin = {i: [] for i in range(0, 6)}
     month_basin = {i: [] for i in range(0, 6)}
+    lat_basin = {i: [] for i in range(0,6)}
 
     for i in range(len(latlist)):
         if len(latlist[i]) > 0:
@@ -310,131 +302,144 @@ def wind_pressure_relationship(idx_basin, months):
             check = check_season(idx, month)
             # print(idx,month,check)
             if check == 1:
-                MSLP = np.loadtxt(
-                    os.path.join(
-                        __location__, "Monthly_mean_MSLP_" + str(month) + ".txt"
-                    )
-                )
                 for j in range(0, len(latlist[i])):
                     # Wind needs to be greater than 15 kt.
                     latn = np.abs(lat - latlist[i][j]).argmin()
                     lonn = np.abs(lon - lonlist[i][j]).argmin()
+                    
+                    observation_time = (
+                        pd.Timestamp("1858-11-17")
+                        + pd.to_timedelta(timelist[i][j], unit="D")
+                    )
+    
+                    valid_i = observation_time.to_period("M").to_timestamp()
+
+                    #Temp fix
+                    if valid_i.year == 1979:
+                        continue
+                    mslp_ij = float(
+                        mslp["msl"]
+                        .isel(latitude=latn, longitude=lonn)
+                        .sel(valid_time=valid_i)
+                        .item()
+                    ) / 100
+
                     if (
                         preslist[i][j] > 0
-                        and MSLP[latn][lonn] - preslist[i][j] > 0
+                        and mslp_ij - preslist[i][j] > 0
                         and windlist[i][j] > 15.0 * 0.5144444
                     ):
-                        pres_basin[idx].append(MSLP[latn][lonn] - preslist[i][j])
+                        pres_basin[idx].append(
+                            mslp_ij
+                            - preslist[i][j]
+                        )
                         wind_basin[idx].append(windlist[i][j])
                         month_basin[idx].append(month)
+                        lat_basin[idx].append(latlist[i][j])
 
-    coeff_list = {i: [] for i in range(0, 6)}
 
-    # months=[[6,7,8,9,10,11],[6,7,8,9,10,11],[9,10,11],[1,2,3,4,11,12],[1,2,3,4,11,12],[5,6,7,8,9,10,11]]
-
+    coeff_list = {}
+    fit_results = {}
     # months=[[6,7,8,9,10,11],[6,7,8,9,10,11],[4,5,6,9,10,11],[1,2,3,4,11,12],[1,2,3,4,11,12],[5,6,7,8,9,10,11]]
 
-    for ii in range(len(idx_basin)):
-        idx = idx_basin[ii]
-        print("analasing: ", idx, "basin in wind relationship")
-        coeff_list[idx] = {i: [] for i in months[idx]}
-
-        # ---- FIX: Build full-basin DataFrame once ----
+    for idx in idx_basin:
+        print(f"Analysing basin {idx}")
+        
         df = pd.DataFrame(
             {
                 "Wind": wind_basin[idx],
                 "Pressure": pres_basin[idx],
                 "Month": month_basin[idx],
+                "Latitude": lat_basin[idx],
             }
         )
-
-        # ---- FIX: Fit basin-wide WPR first as fallback ----
-        basin_coef = []
-        if len(df) > 10:
-            step = 2.0
-            to_bin = lambda x: np.floor(x / step) * step
-            df_all = df.copy()
-            df_all["windbin"] = df_all["Wind"].map(to_bin)
-            minpres_all = df_all.groupby("windbin")["Pressure"].mean()
-            maxwind_all = np.array(minpres_all.index)
-            minpres_all = minpres_all.values
-            # Remove NaN/inf
-            valid = (
-                np.isfinite(minpres_all) & np.isfinite(maxwind_all) & (minpres_all > 0)
-            )
-            if valid.sum() >= 3:
-                try:
-                    opt, _ = curve_fit(
-                        Vmax_function,
-                        minpres_all[valid],
-                        maxwind_all[valid],
-                        p0=[0.7, 0.6],
-                        bounds=([0.001, 0.01], [50.0, 3.0]),
-                        maxfev=10000,
-                    )
-                    basin_coef = [opt[0], opt[1]]
-                except (RuntimeError, TypeError):
-                    pass
-
-        for i in range(len(months[idx])):
-            m = months[idx][i]
-            df1 = df[df["Month"] == m].copy()  # ---- FIX: explicit .copy() ----
-
-            if len(df1) < 5:
-                if basin_coef:
-                    coeff_list[idx][m] = basin_coef
-                    print(
-                        f"  Month {m}: too few points ({len(df1)}), using basin-wide fit"
-                    )
-                else:
-                    print(f"  Month {m}: too few points and no basin fallback")
-                continue
-
-            step = 2.0  # Group in 2 m/s bins
-            to_bin = lambda x: np.floor(x / step) * step
-            df1["windbin"] = df1["Wind"].map(to_bin)
-            minpres = df1.groupby("windbin")["Pressure"].mean()
-            maxwind = np.array(minpres.index)
-            minpres = minpres.values
-
-            # ---- FIX: clean data before fitting ----
-            valid = np.isfinite(minpres) & np.isfinite(maxwind) & (minpres > 0)
-            if valid.sum() < 3:
-                if basin_coef:
-                    coeff_list[idx][m] = basin_coef
-                    print(f"  Month {m}: insufficient valid bins, using basin-wide fit")
-                continue
-
-            try:
-                # ---- FIX: add p0 and bounds for robust convergence ----
-                opt, _ = curve_fit(
-                    Vmax_function,
-                    minpres[valid],
-                    maxwind[valid],
-                    p0=[0.7, 0.6],
-                    bounds=([0.001, 0.01], [50.0, 3.0]),
-                    maxfev=10000,
-                )
-                [a, b] = opt
-                coeff_list[idx][m] = [a, b]
-
-            except RuntimeError:
-                print("Optimal parameters not found")
-                if basin_coef:
-                    coeff_list[idx][m] = basin_coef
-                    print(f"  Month {m}: using basin-wide fallback")
-            except TypeError:
-                print("Too few items")
-                if basin_coef:
-                    coeff_list[idx][m] = basin_coef
-
-        # ---- FIX: final safety — fill any remaining empty months ----
+    
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.dropna(
+            subset=[
+                "Wind",
+                "Pressure",
+                "Month",
+                "Latitude",
+            ]
+        )
+    
+        df = df[
+            (df["Wind"] > 0) & (df["Pressure"] > 0) & (df["Month"].isin(months[idx]))
+        ].copy()
+    
+        if len(df) < 30:
+            raise ValueError(f"Insufficient observations for basin {idx}")
+    
+        # ---------------------------------------
+        # Build predictors
+        # ---------------------------------------
+    
+        log_dp = np.log(df["Pressure"].to_numpy())
+    
+        lat = (np.abs(df["Latitude"].to_numpy()) - 20.0) / 10.0
+    
+        X = np.column_stack(
+            [
+                np.ones(len(df)),
+                log_dp,
+                lat,
+            ]
+        )
+        y = np.log(df["Wind"].to_numpy())
+        # ---------------------------------------
+        # Fit linear regression in log space
+        # ---------------------------------------
+    
+        beta, _, rank, _ = np.linalg.lstsq(X, y, rcond=None)
+    
+        if rank < X.shape[1]:
+            raise ValueError(f"Rank-deficient regression for basin {idx}")
+    
+        (
+            intercept,
+            b_pressure,
+            b_lat,
+        ) = beta
+    
+        if b_pressure <= 0:
+            raise ValueError(f"Non-positive pressure exponent for basin {idx}")
+    
+        # ---------------------------------------
+        # In-sample diagnostics
+        # ---------------------------------------
+        y_pred = X @ beta
+        residuals = y - y_pred
+        sigma = np.sqrt(np.sum(residuals**2) / (len(y) - X.shape[1]))
+        fit_results[idx] = {
+            "beta": beta,
+            "sigma": sigma,
+            "n_observations": len(df),
+            "n_storms": df["StormID"].nunique(),
+        }
+    
+        # ---------------------------------------
+        # Convert monthly effect to A_b(m)
+        # ---------------------------------------
+    
+        coeff_list[idx] = {}
         for m in months[idx]:
-            if not coeff_list[idx][m] and basin_coef:
-                coeff_list[idx][m] = basin_coef
-                print(f"  Month {m}: filled with basin-wide fallback (final pass)")
+            log_a = intercept
+            a = np.exp(log_a)
+            coeff_list[idx][m] = [
+                a,
+                b_pressure,
+                b_lat,
+            ]
+    np.save(
+        os.path.join(__location__, "COEFFICIENTS_WPR_PER_MONTH.npy"),
+        coeff_list,
+    )
 
-    np.save(os.path.join(__location__, "COEFFICIENTS_WPR_PER_MONTH.npy"), coeff_list)
+    np.save(
+        os.path.join(__location__, "WPR_FIT_RESULTS.npy"),
+        fit_results,
+    )
 
 
 def MPI_function(T, A, B, C):
