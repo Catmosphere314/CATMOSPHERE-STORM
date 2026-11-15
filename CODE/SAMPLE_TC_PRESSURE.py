@@ -263,6 +263,7 @@ def Calculate_Pressure_old(Vmax10, Penv, coef):
     return Pc
 
 def Calculate_Pressure(Vmax10, Penv, lat, coef):
+    """Invert function for Vmax to pressure"""
     [a, b_pressure , b_lat] = coef
     Pc = Penv - ((Vmax10 / a)  * np.exp(- b_lat * (np.abs(lat) - 20) / 10)) ** (1/b_pressure)
     return Pc 
@@ -339,7 +340,7 @@ def decay_after_landfall(lat_landfall, lon_landfall, latlijst, lonlijst, p, coef
     alpha = 0.095
     vb = 26.7
 
-    v0 = Calculate_Vmax(Penv, p, coef)
+    v0 = Calculate_Vmax(Penv, p, lat_landfall, coef)
 
     wind_decay = []
     pressure_decay = []
@@ -369,7 +370,7 @@ def decay_after_landfall(lat_landfall, lon_landfall, latlijst, lonlijst, p, coef
                 v = vb + (R * v0 - vb) * np.exp(-alpha * t) - C_KM
                 if v * kt_to_ms < TS_THRESHOLD_MS:
                     return pressure_decay, wind_decay
-                pres_landfall = Calculate_Pressure(v * kt_to_ms, Penv, coef)
+                pres_landfall = Calculate_Pressure(v * kt_to_ms, Penv, latlijst[j], coef)
                 pres_landfall = round(pres_landfall, 1)
                 pressure_decay.append(pres_landfall)
                 wind_decay.append(v * kt_to_ms)
@@ -385,6 +386,7 @@ def decay_after_landfall(lat_landfall, lon_landfall, latlijst, lonlijst, p, coef
 
 
 def decay_after_landfall_env(lat_landfall, lon_landfall, latlist, lonlist, p, coef, Penv):
+    """here should be the implementation of the decay after landfall with environmental fields using the STORM-L model"""
 
 
 
@@ -649,7 +651,7 @@ def TC_pressure(
 
                 if i == 0:
                     vmax = random.choice(Genwind[idx][month])
-                    p = Calculate_Pressure(vmax, Penv, coef)
+                    p = Calculate_Pressure(vmax, Penv,lat, coef)
 
                     pressure_list = []
                     wind_list = []
@@ -779,7 +781,7 @@ def TC_pressure(
 
                         else:
                             pressure_list.append(p)
-                            vmax = Calculate_Vmax(Penv, p, coef)
+                            vmax = Calculate_Vmax(Penv, p,lat, coef)
                             vmax = round(vmax, 1)
                             wind_list.append(vmax)
 
@@ -970,7 +972,7 @@ def TC_pressure(
 
                         else:
                             pressure_list.append(p)
-                            vmax = Calculate_Vmax(Penv, p, coef)
+                            vmax = Calculate_Vmax(Penv, p,lat, coef)
                             vmax = round(vmax, 1)
                             wind_list.append(vmax)
                             i = i + 1
