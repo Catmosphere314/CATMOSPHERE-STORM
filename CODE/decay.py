@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from CODE.land_fraction import get_land_fraction, LAND_FRACTION_PATH
+from CODE.geography import is_land, LAND_MASK_PATH
 from CODE.preprocessing import convert_wind_speed
 from CODE.siena_utils import TS_THRESHOLD_MS
 
@@ -19,7 +20,7 @@ __location__ = os.getcwd()
 
 WEIGHTS_PRESENT_FUTURE = [0.2, 0.8]  # calibration and simulator must match
 DEFAULT_DECAY_PARAMETERS_PATH = (
-    Path(__file__).resolve().parents[1] / "parameters" / "storm_l_decay.json"
+    Path(__file__).resolve().parents[1] / "DATA" / "parameters" / "storm_l_decay.json"
 )
 
 
@@ -32,6 +33,12 @@ def save_decay_parameters(parameters, filepath):
         "land_fraction_weights": WEIGHTS_PRESENT_FUTURE,
         "radius_km": 100,
         "land_fraction_raster": str(LAND_FRACTION_PATH),
+        "binary_land_mask": str(LAND_MASK_PATH),
+        "coastline_source": "GSHHG 2.3.7 / GSHHS_f_L1",
+        "lake_policy": "land",
+        "binary_resolution_deg": 0.01,
+        "fraction_resolution_deg": 0.05,
+        "fraction_source_resolution_deg": 0.025,
         "basins": parameters,
     }
 
@@ -49,6 +56,10 @@ def load_decay_parameters(filepath):
         raise ValueError("STORM-L parameters expect a 100 km land-fraction radius")
     if payload.get("land_fraction_raster") != str(LAND_FRACTION_PATH):
         raise ValueError("Calibration and simulator land-fraction raster paths differ")
+    if payload.get("binary_land_mask") != str(LAND_MASK_PATH):
+        raise ValueError("Calibration and simulator binary land-mask paths differ")
+    if payload.get("coastline_source") != "GSHHG 2.3.7 / GSHHS_f_L1":
+        raise ValueError("Coastline dataset differs from fitted coefficients")
 
     return payload["basins"]
 
@@ -198,7 +209,9 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
     for sid, storm in df.groupby("sid", sort=False):
         storm = storm.reset_index(drop=True)
 
-        on_land = storm["dist2land"].eq(0).to_numpy()
+        on_land = np.asarray(
+            is_land(storm["lat"].to_numpy(), storm["lon"].to_numpy()), dtype=bool
+        )
 
         # Indices at which storm center first moves over land
         starts = np.flatnonzero(on_land & ~np.r_[False, on_land[:-1]])
@@ -238,7 +251,8 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
             # Include the last offshore observation
             segment = storm.iloc[start - 1 : end].copy()
 
-            segment["on_land"] = segment["dist2land"] == 0
+            # GSHHG classification, consistent with genesis and track.
+            segment["on_land"] = on_land[start - 1 : end]
 
             # Require at least 3 measured inland winds
             if segment.loc[segment["on_land"], "wind_ms"].notna().sum() < 3:

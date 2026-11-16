@@ -20,6 +20,7 @@ from CODE.siena_utils import (
 )
 import os
 import sys
+from CODE.geography import is_land
 
 __location__ = os.path.realpath(os.getcwd())
 dir_path = __location__
@@ -104,7 +105,6 @@ def _get_vws_at_point(vws_field, lat, lon):
 # of text each time).  Now loaded once per process and reused.
 
 _TRACK_COEFF_CACHE = None  # dict from np.load().item()
-_LAND_MASK_CACHE = {}  # {basin_str: ndarray}
 
 
 def _get_track_coefficients():
@@ -119,27 +119,15 @@ def _get_track_coefficients():
     return _TRACK_COEFF_CACHE
 
 
-def _get_land_mask(basin):
-    """Load Land_ocean_mask_<basin>.txt once per (process, basin)."""
-    if basin not in _LAND_MASK_CACHE:
-        _LAND_MASK_CACHE[basin] = np.loadtxt(
-            os.path.join(
-                __location__, "Land_ocean_masks/Land_ocean_mask_" + str(basin) + ".txt"
-            )
-        )
-    return _LAND_MASK_CACHE[basin]
-
-
 def find_lat_index_bins(basin, lat):
     lat0 = _BASIN_BOUNDS[basin][0]
     base = 5
     return np.floor(float(lat - lat0) / base)
 
 
-def Check_if_landfall(lat, lon, lat1, lon0, land_mask):
-    x_coord = int(10 * (lon - lon0))
-    y_coord = int(10 * (lat1 - lat))
-    return land_mask[y_coord, x_coord]
+def Check_if_landfall(lat, lon, lat1=None, lon0=None, land_mask=None):
+    """Compatibility wrapper using shared GSHHG 0.01-degree binary mask."""
+    return is_land(lat, lon)
 
 
 def TC_movement(
@@ -173,7 +161,6 @@ def TC_movement(
     basin_name = dict(zip(basins, [0, 1, 2, 3, 4, 5]))
     idx = basin_name[basin]
     constants_all = _get_track_coefficients()  # was: np.load(...) every call
-    land_mask = _get_land_mask(basin)  # was: np.loadtxt(...) every call
     constants = constants_all[idx]
     lat0, lat1, lon0, lon1 = _BASIN_BOUNDS[basin]
     latall = []
@@ -199,9 +186,7 @@ def TC_movement(
 
         latlijst = [lat_genesis]
         lonlijst = [lon_genesis]
-        landfalllijst = [
-            Check_if_landfall(lat_genesis, lon_genesis, lat1, lon0, land_mask)
-        ]
+        landfalllijst = [is_land(lat_genesis, lon_genesis)]
         lat = lat_genesis
         lon = lon_genesis
         var = 0
@@ -296,7 +281,7 @@ def TC_movement(
             if lat <= lat1 - 0.1 and lat > lat0 and lon <= lon1 - 0.1 and lon > lon0:
                 latlijst.append(lat)
                 lonlijst.append(lon)
-                landfalllijst.append(Check_if_landfall(lat, lon, lat1, lon0, land_mask))
+                landfalllijst.append(is_land(lat, lon))
             else:
                 var = 1
         latall.append(latlijst)

@@ -7,10 +7,7 @@ This is the script for generating the genesis matrices in Python 3 (with Cartopy
 import numpy as np
 import os
 import sys
-import cartopy.io.shapereader as shpreader
-import shapely.geometry as sgeom
-from shapely.ops import unary_union
-from shapely.prepared import prep
+from CODE.geography import is_land as gshhg_is_land
 import pandas as pd
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
@@ -53,41 +50,8 @@ def basin_cell_centers(basin, rows, cols):
 
 __location__ = os.path.realpath(os.getcwd())  # TEMP FIX?
 dir_path = __location__
-land_shp_fname = shpreader.natural_earth(
-    resolution="50m", category="physical", name="land"
-)
-
-land_geom = unary_union(list(shpreader.Reader(land_shp_fname).geometries()))
-land = prep(land_geom)
-
-
-def is_land(x, y):
-    return land.contains(sgeom.Point(x, y))
-
-
-
-def create_mask(basin):
-    stepsize = 10
-    lat0, lat1, lon0, lon1 = BOUNDARIES_BASINS(basin)
-    x = int(abs(lon1 - lon0) * stepsize)
-    y = int(abs(lat1 - lat0) * stepsize)
-    if lon0 < 180:  # south pacific
-        lon_grid, lat_grid = np.mgrid[
-            lon0 : lon1 : complex(0, x), lat0 : lat1 : complex(0, y)
-        ]
-    else:
-        lon_grid, lat_grid = np.mgrid[
-            lon0 - 360 : lon1 - 360 : complex(0, x), lat0 : lat1 : complex(0, y)
-        ]
-
-    mask = np.ones((len(lon_grid[0]), len(lon_grid)))
-    for i in range(len(lon_grid)):
-        for j in range(len(lon_grid[i])):
-            mask[j][i] = is_land(lon_grid[i][j], lat_grid[i][j])
-
-    mask = np.flipud(mask)
-
-    return mask
+# No Natural Earth polygon union or 0.1-degree legacy mask at import time.
+# All genesis spatial filtering uses the shared GSHHG 0.01-degree mask.
 
 
 def BOUNDARIES_BASINS(idx):
@@ -108,35 +72,37 @@ def BOUNDARIES_BASINS(idx):
 
 
 def _genesis_ocean_mask_1deg(basin, shape):
+    """Preserve the legacy <50%-land rule for each 1-degree genesis bin.
+
+    A 10x10 sub-cell sample is sufficient for this coarse probability mask;
+    the final genesis coordinates and every simulated track lookup use the
+    underlying GSHHG 0.01-degree binary classifier directly.
+    """
     rows, cols = shape
-
-    mask_path = os.path.join(
-        __location__, f"Land_ocean_masks/Land_ocean_mask_{basin}.txt"
-    )
-    land10 = np.loadtxt(mask_path)
-
-    # Stored masks include endpoints, e.g. NA is 551 x 1051.
-    # Drop endpoints so we can aggregate exact 10x10 blocks to 1 degree.
-    land10 = land10[: rows * 10, : cols * 10]
-    landfrac = land10.reshape(rows, 10, cols, 10).mean(axis=(1, 3))
-    ocean = landfrac < 0.5
-
     lat0, lat1, lon0, lon1 = BOUNDARIES_BASINS(basin)
+    lat_centres = lat1 - (
+        np.arange(rows)[:, None] + (np.arange(10)[None, :] + 0.5) / 10
+    )
+    lon_centres = lon0 + (
+        np.arange(cols)[:, None] + (np.arange(10)[None, :] + 0.5) / 10
+    )
+    LAT, LON = np.meshgrid(lat_centres.ravel(), lon_centres.ravel(), indexing="ij")
+    covered = gshhg_is_land(LAT, LON).reshape(rows, 10, cols, 10).mean(axis=(1, 3))
+    ocean = covered < 0.5
+
     lats = lat1 - (np.arange(rows) + 0.5)
     lons = lon0 + (np.arange(cols) + 0.5)
     LON, LAT = np.meshgrid(lons, lats)
 
-    # Match the runtime NA/EP Central America split.
+    # Preserve NA/EP genesis exclusion across Central America.
     if basin == "NA":
         lat_isthmus = 16.0 - 0.571 * (LON - 268.0)
         pacific_side = (LON >= 255.0) & (LON < 285.0) & (LAT < lat_isthmus)
         ocean &= ~pacific_side
-
     elif basin == "EP":
         lat_isthmus = 16.0 - 0.571 * (LON - 268.0)
         atlantic_side = (LON >= 255.0) & (LON < 285.0) & (LAT >= lat_isthmus)
         ocean &= ~atlantic_side
-
     return ocean
 
 
@@ -210,25 +176,9 @@ def create_1deg_grid(delta_count_matrix, basin, month):
     grid = np.flipud(grid)
     grid[grid < 0] = 0
 
-    # overlay data with a land-sea mask
-    mdata = create_mask(basin)
-    coarseness = 10
-    mdata_coarse = mdata.reshape(
-        (
-            mdata.shape[0] // coarseness,
-            coarseness,
-            mdata.shape[1] // coarseness,
-            coarseness,
-        )
-    )
-    mdata_coarse = np.mean(mdata_coarse, axis=(1, 3))
-
-    (x, y) = mdata_coarse.shape
-
-    for i in range(0, x):
-        for j in range(0, y):
-            if mdata_coarse[i, j] > 0.50:
-                grid[i, j] = 0.0  # ---- FIX: use 0.0 instead of 'nan' string ----
+    # GSHHG-derived 1-degree ocean admissibility; mask local genesis weights.
+    ocean = _genesis_ocean_mask_1deg(basin, grid.shape)
+    grid[~ocean] = 0.0
 
     # ---- FIX: replace any remaining NaN with 0 ----
     grid = np.nan_to_num(grid, nan=0.0)
