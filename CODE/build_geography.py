@@ -1,19 +1,27 @@
 """Offline GSHHG L1 raster builder (NOT imported during simulation).
 
-Download GSHHG shapefiles 2.3.7 from the SOEST project and extract
-GSHHS_shp/f/GSHHS_f_L1.shp. L1 alone includes inland lakes as land.
+One-command setup: download and verify GSHHG 2.3.7, extract only the
+Full-resolution Level-1 shapefile, and generate both runtime rasters:
+
+    python -m CODE.build_geography --download
+
+Alternatively, use an existing local shapefile:
 
     python -m CODE.build_geography --shapefile /path/GSHHS_f_L1.shp
 
-Build the 0.01-degree binary and 0.025-degree source masks, then the
-0.05-degree 100-km land-fraction raster. Rasterize latitude stripes so
-full-resolution polygons do not require a global dense in-memory raster.
+Level 1 includes inland lakes as land. Latitude stripes keep memory bounded.
 """
 
 from __future__ import annotations
 import argparse
+import hashlib
 import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
+from urllib.request import Request, urlopen
+from zipfile import BadZipFile, ZipFile
 import numpy as np
 
 from CODE.geography import (
@@ -26,6 +34,151 @@ from CODE.geography import (
 
 SOURCE_MASK_PATH = GEOGRAPHY_DIR / "gshhg_f_L1_land_0p025_packed.npy"
 SOURCE_RESOLUTION = 0.025
+
+# Pin the exact archive rather than following a mutable "latest" URL.
+GSHHG_VERSION = "2.3.7"
+GSHHG_ARCHIVE_NAME = f"gshhg-shp-{GSHHG_VERSION}.zip"
+GSHHG_ARCHIVE_SHA256 = (
+    "8dbbe7e071e77e9e75f2d639239099ebca8d5c16d6a07df8169729d49f15cf41"
+)
+GSHHG_URLS = (
+    f"https://ftp.soest.hawaii.edu/gshhg/{GSHHG_ARCHIVE_NAME}",
+    f"https://github.com/GenericMappingTools/gshhg-gmt/releases/download/"
+    f"{GSHHG_VERSION}/{GSHHG_ARCHIVE_NAME}",
+)
+DEFAULT_DOWNLOAD_DIR = GEOGRAPHY_DIR / "gshhg"
+SHAPEFILE_BASENAME = "GSHHS_f_L1"
+# These are the shapefile components needed by Fiona. PRJ identifies CRS.
+SHAPEFILE_EXTENSIONS = (".shp", ".shx", ".dbf", ".prj")
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _shapefile_complete(path):
+    path = Path(path)
+    return all(
+        (path.parent / f"{path.stem}{ext}").is_file()
+        and (path.parent / f"{path.stem}{ext}").stat().st_size > 0
+        for ext in SHAPEFILE_EXTENSIONS
+    )
+
+
+def _download_verified_archive(
+    destination, urls=GSHHG_URLS, expected_sha256=GSHHG_ARCHIVE_SHA256
+):
+    """Download with streaming I/O and an atomic rename after SHA-256 validation."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    errors = []
+    for url in urls:
+        temp_path = None
+        try:
+            print(f"Downloading GSHHG {GSHHG_VERSION} from {url}", flush=True)
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=".gshhg-download-",
+                suffix=".part",
+                delete=False,
+            ) as temp:
+                temp_path = Path(temp.name)
+                request = Request(url, headers={"User-Agent": "CATMOSPHERE-STORM/1.0"})
+                with urlopen(request, timeout=90) as response:
+                    shutil.copyfileobj(response, temp, length=1024 * 1024)
+            digest = _sha256(temp_path)
+            if digest.lower() != expected_sha256.lower():
+                raise ValueError(
+                    f"SHA256 mismatch: {digest}; expected {expected_sha256}"
+                )
+            os.replace(temp_path, destination)
+            print(f"Verified archive SHA-256: {digest}")
+            return destination
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            print(f"  Source failed: {exc}", flush=True)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+    raise RuntimeError(
+        "Failed to download a valid GSHHG archive. Sources tried:\n  "
+        + "\n  ".join(errors)
+    )
+
+
+def _extract_l1(archive, destination):
+    """Extract only the L1 full-resolution shapefile; never trust ZIP paths."""
+    archive = Path(archive)
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    with ZipFile(archive) as zf:
+        entries = {}
+        for name in zf.namelist():
+            normalized = name.replace("\\", "/")
+            for ext in SHAPEFILE_EXTENSIONS:
+                if normalized.endswith(f"GSHHS_shp/f/{SHAPEFILE_BASENAME}{ext}"):
+                    entries[ext] = name
+        missing = set(SHAPEFILE_EXTENSIONS) - set(entries)
+        if missing:
+            raise ValueError(
+                f"Archive lacks required GSHHG L1 components: {sorted(missing)}"
+            )
+        with tempfile.TemporaryDirectory(
+            prefix=".gshhg-extract-", dir=destination
+        ) as tmp:
+            tmp_path = Path(tmp)
+            for ext in SHAPEFILE_EXTENSIONS:
+                with (
+                    zf.open(entries[ext]) as src,
+                    open(tmp_path / f"{SHAPEFILE_BASENAME}{ext}", "wb") as dst,
+                ):
+                    shutil.copyfileobj(src, dst)
+            for ext in SHAPEFILE_EXTENSIONS:
+                staged = tmp_path / f"{SHAPEFILE_BASENAME}{ext}"
+                if staged.stat().st_size == 0:
+                    raise ValueError(f"Empty shapefile component in archive: {ext}")
+            for ext in SHAPEFILE_EXTENSIONS:
+                os.replace(
+                    tmp_path / f"{SHAPEFILE_BASENAME}{ext}",
+                    destination / f"{SHAPEFILE_BASENAME}{ext}",
+                )
+    path = destination / f"{SHAPEFILE_BASENAME}.shp"
+    if not _shapefile_complete(path):
+        raise RuntimeError(f"Incomplete shapefile extraction: {path}")
+    return path
+
+
+def ensure_gshhg_shapefile(download_dir=DEFAULT_DOWNLOAD_DIR, *, force_download=False):
+    """Return a cached or freshly downloaded and verified GSHHG L1 shapefile.
+
+    Existing complete extracted shapefiles are reused by default. If necessary,
+    a cached ZIP is verified against the published archive SHA-256 before use.
+    """
+    download_dir = Path(download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
+    shapefile = download_dir / f"{SHAPEFILE_BASENAME}.shp"
+    archive = download_dir / GSHHG_ARCHIVE_NAME
+    if not force_download and _shapefile_complete(shapefile):
+        print(f"Reusing extracted GSHHG shapefile: {shapefile}")
+        return shapefile
+    if not force_download and archive.is_file():
+        if _sha256(archive).lower() == GSHHG_ARCHIVE_SHA256:
+            print(f"Reusing SHA-256-verified GSHHG archive: {archive}")
+        else:
+            print("Cached GSHHG archive has an invalid checksum; downloading again.")
+            _download_verified_archive(archive)
+    else:
+        _download_verified_archive(archive)
+    try:
+        shapefile = _extract_l1(archive, download_dir)
+    except (BadZipFile, OSError, ValueError) as exc:
+        raise RuntimeError(f"Could not extract {archive}: {exc}") from exc
+    print(f"GSHHG shapefile ready: {shapefile}")
+    return shapefile
 
 
 def rasterize_gshhg_l1(shapefile, output, resolution, stripe_rows=200):
@@ -169,18 +322,58 @@ def generate_gshhg_land_fraction(
     return output
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--shapefile", required=True, type=Path)
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Build binary and fractional geography rasters from GSHHG Full L1."
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--download",
+        action="store_true",
+        help="Download GSHHG 2.3.7 if needed, verify SHA-256 and extract L1",
+    )
+    source.add_argument(
+        "--shapefile",
+        type=Path,
+        help="Use an existing GSHHS_f_L1.shp (with its .shx/.dbf/.prj files)",
+    )
+    parser.add_argument(
+        "--download-dir",
+        type=Path,
+        default=DEFAULT_DOWNLOAD_DIR,
+        help=f"Cache for downloaded GSHHG archive and shapefile (default: {DEFAULT_DOWNLOAD_DIR})",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Re-download and verify even if an extracted shapefile exists",
+    )
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Download/verify/extract without building the expensive global rasters",
+    )
     parser.add_argument("--stripe-rows", type=int, default=200)
     parser.add_argument("--skip-fraction", action="store_true")
-    args = parser.parse_args()
-    rasterize_gshhg_l1(
-        args.shapefile, LAND_MASK_PATH, BINARY_RESOLUTION, args.stripe_rows
+    args = parser.parse_args(argv)
+    if (args.force_download or args.download_only) and not args.download:
+        parser.error("--force-download and --download-only require --download")
+    if args.stripe_rows <= 0:
+        parser.error("--stripe-rows must be a positive integer")
+
+    shapefile = (
+        ensure_gshhg_shapefile(args.download_dir, force_download=args.force_download)
+        if args.download
+        else args.shapefile
     )
-    rasterize_gshhg_l1(
-        args.shapefile, SOURCE_MASK_PATH, SOURCE_RESOLUTION, args.stripe_rows
-    )
+    if not _shapefile_complete(shapefile):
+        parser.error(f"Missing .shp/.shx/.dbf/.prj components for {shapefile}")
+    if args.download_only:
+        print(f"Verified/extracted GSHHG shapefile: {shapefile}")
+        return
+
+    rasterize_gshhg_l1(shapefile, LAND_MASK_PATH, BINARY_RESOLUTION, args.stripe_rows)
+    rasterize_gshhg_l1(shapefile, SOURCE_MASK_PATH, SOURCE_RESOLUTION, args.stripe_rows)
     if not args.skip_fraction:
         generate_gshhg_land_fraction()
     print("GSHHG geography generated in", GEOGRAPHY_DIR)
