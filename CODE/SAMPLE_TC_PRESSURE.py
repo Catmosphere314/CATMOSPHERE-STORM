@@ -356,67 +356,6 @@ def haversine(lat1, lon1, lat2, lon2):
     return km
 
 
-def decay_after_landfall(lat_landfall, lon_landfall, latlijst, lonlijst, p, coef, Penv):
-    C1 = 0.0109
-    D1 = -0.0503
-    R = 0.9
-    t0 = 150
-    alpha = 0.095
-    vb = 26.7
-
-    v0 = Calculate_Vmax(Penv, p, lat_landfall, coef)
-
-    wind_decay = []
-    pressure_decay = []
-    pressure_decay.append(p)
-    wind_decay.append(v0)
-
-    kt_to_ms = 0.5144444444
-    v0 = v0 / kt_to_ms
-    D0 = 1.0
-    v = v0
-    t = 3
-    j = 1
-    pres_landfall = p
-
-    while v * kt_to_ms > TS_THRESHOLD_MS and j < len(latlijst):
-        try:
-            D = haversine(lat_landfall, lon_landfall, latlijst[j], lonlijst[j])
-            if D == 0.0:
-                pressure_decay.append(pres_landfall)
-                wind_decay.append(v0 * kt_to_ms)
-                j = j + 1
-                t = t + 3
-            if D > 1:
-                M = C1 * t * (t0 - t)
-                b_KM = D1 * t * (t0 - t)
-                C_KM = M * np.log(D / D0) + b_KM
-                v = vb + (R * v0 - vb) * np.exp(-alpha * t) - C_KM
-                if v * kt_to_ms < TS_THRESHOLD_MS:
-                    return pressure_decay, wind_decay
-                pres_landfall = Calculate_Pressure(
-                    v * kt_to_ms, Penv, latlijst[j], coef
-                )
-                pres_landfall = round(pres_landfall, 1)
-                pressure_decay.append(pres_landfall)
-                wind_decay.append(v * kt_to_ms)
-                t = t + 3
-                j = j + 1
-            else:
-                j = j + 1
-                t = t + 3
-        except IndexError:
-            v = -100.0
-
-    return pressure_decay, wind_decay
-
-
-def decay_after_landfall_env(
-    lat_landfall, lon_landfall, latlist, lonlist, p, coef, Penv
-):
-    """here should be the implementation of the decay after landfall with environmental fields using the STORM-L model"""
-
-
 def add_parameters_to_TC_data(
     pressure_list,
     wind_list,
