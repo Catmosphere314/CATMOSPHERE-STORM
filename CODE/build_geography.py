@@ -301,7 +301,17 @@ def rasterize_osm_land(
                 or _sha256(shapefile),
                 "lakes": "land",
                 "resolution_deg": resolution,
-                "grid": "latitude descending / longitude [-180,180); cell centres",
+                "grid": {
+                    "crs": "EPSG:4326",
+                    "latitude_order": "ascending",
+                    "longitude_convention": "0_360",
+                    "grid_registration": "cell_center",
+                    "latitude_first_center": -89.975,
+                    "longitude_first_center": 0.025,
+                    "resolution_deg": 0.05,
+                    "shape": [3600, 7200],
+                    "array_axes": ["latitude", "longitude"],
+                },
                 "pixel_rule": "centre-in-polygon (all_touched=False)",
                 "bit_order": "big",
                 "packed_shape": [rows, cols // 8],
@@ -383,7 +393,17 @@ def generate_osm_land_fraction(
                 "source_resolution_deg": source_resolution,
                 "output_resolution_deg": output_resolution,
                 "shape": [len(lat_out), len(lon_out)],
-                "grid": "latitude increasing / longitude [0,360), cell centres",
+                "grid": {
+                    "crs": "EPSG:4326",
+                    "latitude_order": "ascending",
+                    "longitude_convention": "0_360",
+                    "grid_registration": "cell_center",
+                    "latitude_first_center": -89.975,
+                    "longitude_first_center": 0.025,
+                    "resolution_deg": 0.05,
+                    "shape": [3600, 7200],
+                    "array_axes": ["latitude", "longitude"]
+                }
             },
         )
     finally:
