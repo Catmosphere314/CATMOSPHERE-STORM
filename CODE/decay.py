@@ -17,7 +17,7 @@ __location__ = os.getcwd()
 
 WEIGHTS_PRESENT_FUTURE = [0.2, 0.8]  # calibration and simulator must match
 DEFAULT_DECAY_PARAMETERS_PATH = (
-    Path(__file__).resolve().parents[1] / "DATA" / "parameters" / "storm_l_decay.json"
+    Path(__file__).resolve().parents[1] / "parameters" / "storm_l_decay.json"
 )
 
 
