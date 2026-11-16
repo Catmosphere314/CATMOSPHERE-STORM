@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from CODE.land_fraction import get_land_fraction, LAND_FRACTION_PATH
-from CODE.geography import is_land, LAND_MASK_PATH
+from CODE.geography import is_land, LAND_MASK_PATH, geography_provenance
 from CODE.preprocessing import convert_wind_speed
 from CODE.siena_utils import TS_THRESHOLD_MS
 
@@ -29,16 +29,12 @@ def save_decay_parameters(parameters, filepath):
     filepath.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "land_fraction_weights": WEIGHTS_PRESENT_FUTURE,
         "radius_km": 100,
-        "land_fraction_raster": str(LAND_FRACTION_PATH),
-        "binary_land_mask": str(LAND_MASK_PATH),
-        "coastline_source": "GSHHG 2.3.7 / GSHHS_f_L1",
-        "lake_policy": "land",
-        "binary_resolution_deg": 0.01,
-        "fraction_resolution_deg": 0.05,
-        "fraction_source_resolution_deg": 0.025,
+        "land_fraction_raster": LAND_FRACTION_PATH.name,
+        "binary_land_mask": LAND_MASK_PATH.name,
+        "geography": geography_provenance(),
         "basins": parameters,
     }
 
@@ -54,12 +50,16 @@ def load_decay_parameters(filepath):
         raise ValueError("Land-fraction weighting differs from calibration")
     if payload.get("radius_km") != 100:
         raise ValueError("STORM-L parameters expect a 100 km land-fraction radius")
-    if payload.get("land_fraction_raster") != str(LAND_FRACTION_PATH):
+    if payload.get("land_fraction_raster") != LAND_FRACTION_PATH.name:
         raise ValueError("Calibration and simulator land-fraction raster paths differ")
-    if payload.get("binary_land_mask") != str(LAND_MASK_PATH):
+    if payload.get("binary_land_mask") != LAND_MASK_PATH.name:
         raise ValueError("Calibration and simulator binary land-mask paths differ")
-    if payload.get("coastline_source") != "GSHHG 2.3.7 / GSHHS_f_L1":
-        raise ValueError("Coastline dataset differs from fitted coefficients")
+    if payload.get("schema_version") != 2:
+        raise ValueError("Old STORM-L coefficients: refit with OSM geography")
+    if payload.get("geography") != geography_provenance():
+        raise ValueError(
+            "Coastline snapshot or raster configuration differs from fitted coefficients"
+        )
 
     return payload["basins"]
 
@@ -148,10 +148,12 @@ def _haversine_km(lat0, lon0, lat, lon):
     a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
     return 6371 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
+
 def _decode_agency(value):
     if isinstance(value, bytes):
         return value.decode("utf-8").strip()
     return str(value).strip()
+
 
 def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
 
@@ -167,6 +169,7 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
             "name",
             "iso_time",
             "wmo_wind",
+            "wmo_agency",
             "wmo_pres",
             "track_type",
             "main_track_sid",
@@ -177,7 +180,7 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
         ]
     ]
     df1["wind_ms"] = [
-        convert_wind_speed(w * 0.51444444, decode_agency(a))
+        convert_wind_speed(w * 0.51444444, _decode_agency(a))
         for w, a in zip(df1["wmo_wind"], df1["wmo_agency"])
     ]
 
@@ -251,7 +254,7 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
             # Include the last offshore observation
             segment = storm.iloc[start - 1 : end].copy()
 
-            # GSHHG classification, consistent with genesis and track.
+            # OpenStreetMap classification, consistent with genesis and track.
             segment["on_land"] = on_land[start - 1 : end]
 
             # Require at least 3 measured inland winds

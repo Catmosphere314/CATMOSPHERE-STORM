@@ -1,27 +1,31 @@
-"""Offline GSHHG L1 raster builder (NOT imported during simulation).
+"""Build CATMOSPHERE-STORM geography from OpenStreetMap coastline land polygons.
 
-One-command setup: download and verify GSHHG 2.3.7, extract only the
-Full-resolution Level-1 shapefile, and generate both runtime rasters:
-
+One-time setup (large global OSM download):
     python -m CODE.build_geography --download
 
-Alternatively, use an existing local shapefile:
+Or use a previously extracted WGS84 shapefile:
+    python -m CODE.build_geography --shapefile /path/land_polygons.shp
 
-    python -m CODE.build_geography --shapefile /path/GSHHS_f_L1.shp
+Source: https://osmdata.openstreetmap.de/data/land-polygons.html
+WGS84 split polygons are preferred for spatial-filtered rasterization; overlapping
+split polygons combine by OR and do not double-count land. Lakes count as land.
 
-Level 1 includes inland lakes as land. Latitude stripes keep memory bounded.
+During simulation no shapefiles are opened: workers use two read-only .npy maps.
 """
 
 from __future__ import annotations
+
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import tempfile
-from pathlib import Path
 from urllib.request import Request, urlopen
-from zipfile import BadZipFile, ZipFile
+from zipfile import ZipFile, BadZipFile
+
 import numpy as np
 
 from CODE.geography import (
@@ -32,230 +36,288 @@ from CODE.geography import (
     FRACTION_RESOLUTION,
 )
 
-SOURCE_MASK_PATH = GEOGRAPHY_DIR / "gshhg_f_L1_land_0p025_packed.npy"
 SOURCE_RESOLUTION = 0.025
-
-# Pin the exact archive rather than following a mutable "latest" URL.
-GSHHG_VERSION = "2.3.7"
-GSHHG_ARCHIVE_NAME = f"gshhg-shp-{GSHHG_VERSION}.zip"
-GSHHG_ARCHIVE_SHA256 = (
-    "8dbbe7e071e77e9e75f2d639239099ebca8d5c16d6a07df8169729d49f15cf41"
-)
-GSHHG_URLS = (
-    f"https://ftp.soest.hawaii.edu/gshhg/{GSHHG_ARCHIVE_NAME}",
-    f"https://github.com/GenericMappingTools/gshhg-gmt/releases/download/"
-    f"{GSHHG_VERSION}/{GSHHG_ARCHIVE_NAME}",
-)
-DEFAULT_DOWNLOAD_DIR = GEOGRAPHY_DIR / "gshhg"
-SHAPEFILE_BASENAME = "GSHHS_f_L1"
-# These are the shapefile components needed by Fiona. PRJ identifies CRS.
-SHAPEFILE_EXTENSIONS = (".shp", ".shx", ".dbf", ".prj")
+SOURCE_MASK_PATH = GEOGRAPHY_DIR / "osm_land_0p025_packed.npy"
+OSM_LAND_POLYGONS_PAGE = "https://osmdata.openstreetmap.de/data/land-polygons.html"
+OSM_URL = "https://osmdata.openstreetmap.de/download/land-polygons-split-4326.zip"
+ARCHIVE_NAME = "land-polygons-split-4326.zip"
+DEFAULT_DOWNLOAD_DIR = GEOGRAPHY_DIR / "osm"
+SHAPEFILE_BASENAME = "land_polygons"
+REQUIRED_EXTENSIONS = (".shp", ".shx", ".dbf", ".prj")
+OPTIONAL_EXTENSIONS = (".cpg",)
+SOURCE_NAME = "OpenStreetMap / osmdata land polygons"
 
 
 def _sha256(path):
     digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
     return digest.hexdigest()
 
 
-def _shapefile_complete(path):
+def _complete_shapefile(path):
     path = Path(path)
     return all(
         (path.parent / f"{path.stem}{ext}").is_file()
         and (path.parent / f"{path.stem}{ext}").stat().st_size > 0
-        for ext in SHAPEFILE_EXTENSIONS
+        for ext in REQUIRED_EXTENSIONS
     )
 
 
-def _download_verified_archive(
-    destination, urls=GSHHG_URLS, expected_sha256=GSHHG_ARCHIVE_SHA256
-):
-    """Download with streaming I/O and an atomic rename after SHA-256 validation."""
+def _atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.stem}-",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp:
+        temp = Path(tmp.name)
+        json.dump(value, tmp, indent=2)
+    os.replace(temp, path)
+
+
+def _download_archive(destination, url=OSM_URL):
+    """Stream mutable upstream ZIP to temporary file and atomically replace cache.
+
+    The publisher does not supply a pinned checksum for this rolling download.
+    We therefore record the acquired ZIP SHA256 for reproducibility, NOT as
+    an externally verified publisher checksum.
+    """
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    errors = []
-    for url in urls:
-        temp_path = None
-        try:
-            print(f"Downloading GSHHG {GSHHG_VERSION} from {url}", flush=True)
-            with tempfile.NamedTemporaryFile(
-                dir=destination.parent,
-                prefix=".gshhg-download-",
-                suffix=".part",
-                delete=False,
-            ) as temp:
-                temp_path = Path(temp.name)
-                request = Request(url, headers={"User-Agent": "CATMOSPHERE-STORM/1.0"})
-                with urlopen(request, timeout=90) as response:
-                    shutil.copyfileobj(response, temp, length=1024 * 1024)
-            digest = _sha256(temp_path)
-            if digest.lower() != expected_sha256.lower():
-                raise ValueError(
-                    f"SHA256 mismatch: {digest}; expected {expected_sha256}"
-                )
-            os.replace(temp_path, destination)
-            print(f"Verified archive SHA-256: {digest}")
-            return destination
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-            print(f"  Source failed: {exc}", flush=True)
-        finally:
-            if temp_path is not None:
-                temp_path.unlink(missing_ok=True)
-    raise RuntimeError(
-        "Failed to download a valid GSHHG archive. Sources tried:\n  "
-        + "\n  ".join(errors)
-    )
+    tmp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=".osm-coastline-",
+            suffix=".part",
+            delete=False,
+        ) as out:
+            tmp_file = Path(out.name)
+            req = Request(url, headers={"User-Agent": "CATMOSPHERE-STORM/1.0"})
+            print(f"Downloading OSM land polygons (large archive): {url}", flush=True)
+            with urlopen(req, timeout=180) as response:
+                while chunk := response.read(8 * 1024 * 1024):
+                    out.write(chunk)
+        with ZipFile(tmp_file) as zf:
+            if not any(
+                p.replace("\\", "/").endswith("/land_polygons.shp")
+                or p == "land_polygons.shp"
+                for p in zf.namelist()
+            ):
+                raise ValueError("Downloaded ZIP is not an OSM land polygons archive")
+        digest = _sha256(tmp_file)
+        os.replace(tmp_file, destination)
+        print(f"OSM source snapshot SHA256: {digest}")
+        return digest
+    finally:
+        if tmp_file is not None:
+            tmp_file.unlink(missing_ok=True)
 
 
-def _extract_l1(archive, destination):
-    """Extract only the L1 full-resolution shapefile; never trust ZIP paths."""
-    archive = Path(archive)
-    destination = Path(destination)
+def _extract_shapefile(archive, destination):
+    """Extract only required OSM shapefile components, streaming to disk."""
+    archive, destination = Path(archive), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     with ZipFile(archive) as zf:
-        entries = {}
-        for name in zf.namelist():
-            normalized = name.replace("\\", "/")
-            for ext in SHAPEFILE_EXTENSIONS:
-                if normalized.endswith(f"GSHHS_shp/f/{SHAPEFILE_BASENAME}{ext}"):
-                    entries[ext] = name
-        missing = set(SHAPEFILE_EXTENSIONS) - set(entries)
+        names = {}
+        for member in zf.namelist():
+            normalized = member.replace("\\", "/")
+            for ext in (*REQUIRED_EXTENSIONS, *OPTIONAL_EXTENSIONS):
+                if Path(normalized).name == f"{SHAPEFILE_BASENAME}{ext}":
+                    if ext in names:
+                        raise ValueError(f"Duplicate shapefile component in ZIP: {ext}")
+                    names[ext] = member
+        missing = set(REQUIRED_EXTENSIONS).difference(names)
         if missing:
-            raise ValueError(
-                f"Archive lacks required GSHHG L1 components: {sorted(missing)}"
-            )
+            raise ValueError(f"Missing components in OSM ZIP: {sorted(missing)}")
+        # Avoid excessive expansion from an unexpected archive.
+        total_uncompressed = sum(zf.getinfo(name).file_size for name in names.values())
+        if total_uncompressed > 25 * (1024**3):
+            raise ValueError("Unexpectedly large extracted OSM shapefile")
         with tempfile.TemporaryDirectory(
-            prefix=".gshhg-extract-", dir=destination
+            dir=destination, prefix=".osm-extract-"
         ) as tmp:
-            tmp_path = Path(tmp)
-            for ext in SHAPEFILE_EXTENSIONS:
+            staged = Path(tmp)
+            for ext, member in names.items():
                 with (
-                    zf.open(entries[ext]) as src,
-                    open(tmp_path / f"{SHAPEFILE_BASENAME}{ext}", "wb") as dst,
+                    zf.open(member) as source,
+                    (staged / f"{SHAPEFILE_BASENAME}{ext}").open("wb") as target,
                 ):
-                    shutil.copyfileobj(src, dst)
-            for ext in SHAPEFILE_EXTENSIONS:
-                staged = tmp_path / f"{SHAPEFILE_BASENAME}{ext}"
-                if staged.stat().st_size == 0:
-                    raise ValueError(f"Empty shapefile component in archive: {ext}")
-            for ext in SHAPEFILE_EXTENSIONS:
+                    shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+                if (staged / f"{SHAPEFILE_BASENAME}{ext}").stat().st_size == 0:
+                    raise ValueError(f"Empty {ext} component")
+            for ext in names:
                 os.replace(
-                    tmp_path / f"{SHAPEFILE_BASENAME}{ext}",
+                    staged / f"{SHAPEFILE_BASENAME}{ext}",
                     destination / f"{SHAPEFILE_BASENAME}{ext}",
                 )
     path = destination / f"{SHAPEFILE_BASENAME}.shp"
-    if not _shapefile_complete(path):
-        raise RuntimeError(f"Incomplete shapefile extraction: {path}")
+    if not _complete_shapefile(path):
+        raise RuntimeError("OSM coastline shapefile extraction incomplete")
     return path
 
 
-def ensure_gshhg_shapefile(download_dir=DEFAULT_DOWNLOAD_DIR, *, force_download=False):
-    """Return a cached or freshly downloaded and verified GSHHG L1 shapefile.
+def ensure_osm_shapefile(download_dir=DEFAULT_DOWNLOAD_DIR, *, force_download=False):
+    """Reuse or obtain official split-WGS84 OSM land polygons.
 
-    Existing complete extracted shapefiles are reused by default. If necessary,
-    a cached ZIP is verified against the published archive SHA-256 before use.
+    Returns (path, provenance). Archive and metadata are deliberately cached;
+    use --force-download to obtain a new rolling OSM snapshot.
     """
     download_dir = Path(download_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
     shapefile = download_dir / f"{SHAPEFILE_BASENAME}.shp"
-    archive = download_dir / GSHHG_ARCHIVE_NAME
-    if not force_download and _shapefile_complete(shapefile):
-        print(f"Reusing extracted GSHHG shapefile: {shapefile}")
-        return shapefile
-    if not force_download and archive.is_file():
-        if _sha256(archive).lower() == GSHHG_ARCHIVE_SHA256:
-            print(f"Reusing SHA-256-verified GSHHG archive: {archive}")
-        else:
-            print("Cached GSHHG archive has an invalid checksum; downloading again.")
-            _download_verified_archive(archive)
+    archive = download_dir / ARCHIVE_NAME
+    manifest_file = download_dir / "osm_source.json"
+
+    if (
+        not force_download
+        and _complete_shapefile(shapefile)
+        and manifest_file.is_file()
+    ):
+        info = json.loads(manifest_file.read_text(encoding="utf-8"))
+        if (
+            info.get("source") == SOURCE_NAME
+            and info.get("source_sha256")
+            and archive.exists()
+            and archive.stat().st_size == info.get("archive_bytes")
+        ):
+            print(f"Using cached OSM source: {shapefile}")
+            return shapefile, info
+
+    if force_download or not archive.is_file():
+        digest = _download_archive(archive)
     else:
-        _download_verified_archive(archive)
+        digest = _sha256(archive)
+        print(f"Using existing OSM ZIP (SHA256 {digest})")
+
     try:
-        shapefile = _extract_l1(archive, download_dir)
+        shapefile = _extract_shapefile(archive, download_dir)
     except (BadZipFile, OSError, ValueError) as exc:
-        raise RuntimeError(f"Could not extract {archive}: {exc}") from exc
-    print(f"GSHHG shapefile ready: {shapefile}")
-    return shapefile
+        raise RuntimeError(f"Invalid OSM source archive {archive}: {exc}") from exc
+
+    info = {
+        "source": SOURCE_NAME,
+        "source_url": OSM_URL,
+        "source_sha256": digest,
+        "archive_bytes": archive.stat().st_size,
+        "snapshot_recorded_utc": datetime.now(timezone.utc).isoformat(),
+        "dataset": "land-polygons-split-4326",
+        "license": "ODbL 1.0; © OpenStreetMap contributors",
+    }
+    _atomic_json(manifest_file, info)
+    return shapefile, info
 
 
-def rasterize_gshhg_l1(shapefile, output, resolution, stripe_rows=200):
-    """Create bit-packed north-up global raster at specified resolution.
+def _local_source_info(shapefile):
+    shapefile = Path(shapefile)
+    if not _complete_shapefile(shapefile):
+        raise FileNotFoundError(f"Incomplete shapefile: {shapefile}")
+    # Hash the complete SHP binary for consistent reproducibility on local inputs.
+    return {
+        "source": SOURCE_NAME,
+        "source_url": "user-supplied local WGS84 land polygons",
+        "source_sha256": _sha256(shapefile),
+        "dataset": "locally supplied coastline shapefile",
+        "license": "Check provenance; OSM derivatives are generally ODbL 1.0",
+    }
 
-    Uses Fiona bbox iteration and Rasterio rasterization per latitude stripe.
-    all_touched=False preserves centre-in-polygon semantics; tests should
-    quantify omitted islands smaller than one source pixel.
+
+def rasterize_osm_land(
+    shapefile, output, resolution, stripe_rows=200, *, provenance=None
+):
+    """Rasterize OSM land polygons as an 8x compressed north-up global mask.
+
+    OSM's 'split' land polygons may overlap; rasterize uses OR semantics
+    (burn value 1) so overlapping polygons do not double-count land.
     """
     import fiona
     from rasterio.features import rasterize
     from rasterio.transform import from_origin
 
     shapefile = Path(shapefile)
-    if not shapefile.exists():
+    if not _complete_shapefile(shapefile):
         raise FileNotFoundError(shapefile)
-    rows, cols = int(round(180 / resolution)), int(round(360 / resolution))
+    rows, cols = round(180 / resolution), round(360 / resolution)
     if not (
         np.isclose(rows * resolution, 180)
         and np.isclose(cols * resolution, 360)
         and cols % 8 == 0
     ):
         raise ValueError(
-            "Grid must cover Earth and longitude columns be divisible by 8"
+            "Invalid global resolution (requires divisible-by-8 longitude width)"
         )
+    if stripe_rows < 1:
+        raise ValueError("stripe_rows must be >= 1")
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    bits = np.lib.format.open_memmap(
-        output, mode="w+", dtype=np.uint8, shape=(rows, cols // 8)
-    )
+    metadata_file = output.with_suffix(".json")
+    metadata_file.unlink(missing_ok=True)  # Partial output must not be accepted.
+    staging = output.with_name(f"{output.stem}.building.npy")
+
     try:
         with fiona.open(shapefile) as src:
-            for start in range(0, rows, stripe_rows):
-                stop = min(rows, start + stripe_rows)
-                ymax, ymin = 90 - start * resolution, 90 - stop * resolution
-                # Fiona's bbox filter avoids loading every polygon into Python.
-                shapes = (
-                    (feature["geometry"], 1)
-                    for feature in src.filter(bbox=(-180, ymin, 180, ymax))
-                    if feature["geometry"] is not None
-                )
-                tile = rasterize(
-                    shapes,
-                    out_shape=(stop - start, cols),
-                    transform=from_origin(-180, ymax, resolution, resolution),
-                    fill=0,
-                    dtype=np.uint8,
-                    all_touched=False,
-                )
-                bits[start:stop] = np.packbits(tile, axis=1, bitorder="big")
-                if start % (stripe_rows * 10) == 0:
-                    print(f"  {output.name}: {stop}/{rows} latitude rows")
+            crs = src.crs
+            if crs is None or crs.to_epsg() != 4326:
+                raise ValueError(f"OSM shapefile must use WGS84 EPSG:4326, got {crs}")
+            bits = np.lib.format.open_memmap(
+                staging, mode="w+", dtype=np.uint8, shape=(rows, cols // 8)
+            )
+            try:
+                for start in range(0, rows, stripe_rows):
+                    stop = min(start + stripe_rows, rows)
+                    north, south = 90 - start * resolution, 90 - stop * resolution
+                    shapes = (
+                        (feat["geometry"], 1)
+                        for feat in src.filter(bbox=(-180, south, 180, north))
+                        if feat["geometry"] is not None
+                    )
+                    tile = rasterize(
+                        shapes,
+                        out_shape=(stop - start, cols),
+                        transform=from_origin(-180, north, resolution, resolution),
+                        fill=0,
+                        dtype=np.uint8,
+                        all_touched=False,
+                    )
+                    bits[start:stop] = np.packbits(tile, axis=1, bitorder="big")
+                    if start % max(stripe_rows * 10, 1) == 0:
+                        print(f"  {output.name}: {stop}/{rows} rows", flush=True)
+            finally:
+                bits.flush()
+                del bits
+        os.replace(staging, output)
+        _atomic_json(
+            metadata_file,
+            {
+                "source": SOURCE_NAME,
+                "source_url": (provenance or {}).get("source_url", str(shapefile)),
+                "source_sha256": (provenance or {}).get("source_sha256")
+                or _sha256(shapefile),
+                "lakes": "land",
+                "resolution_deg": resolution,
+                "grid": "latitude descending / longitude [-180,180); cell centres",
+                "pixel_rule": "centre-in-polygon (all_touched=False)",
+                "bit_order": "big",
+                "packed_shape": [rows, cols // 8],
+            },
+        )
     finally:
-        bits.flush()
-        del bits
-    metadata = {
-        "source": "GSHHG",
-        "version": "2.3.7",
-        "layer": "GSHHS_f_L1",
-        "lakes": "land",
-        "resolution_deg": resolution,
-        "grid": "latitude descending / longitude [-180,180)",
-        "pixel_rule": "centre-in-polygon, all_touched=False",
-        "bit_order": "big",
-        "packed_shape": [rows, cols // 8],
-    }
-    output.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
+        staging.unlink(missing_ok=True)
     return output
 
 
 def unpack_source_for_fraction(path=SOURCE_MASK_PATH, resolution=SOURCE_RESOLUTION):
-    """Offline only: unpack a 0.025° source into ~104 MB uint8 (no workers)."""
+    """Offline-only transform of packed source to south-up, [0,360) uint8."""
     packed = np.load(path, mmap_mode="r")
     rows, cols = round(180 / resolution), round(360 / resolution)
     if packed.shape != (rows, cols // 8):
         raise ValueError("Source resolution does not match packed mask")
-    # The source is north-up -180..180; convolution expects south-up 0..360.
     land = np.empty((rows, cols), dtype=np.uint8)
     half = cols // 2
     for i in range(rows):
@@ -265,18 +327,22 @@ def unpack_source_for_fraction(path=SOURCE_MASK_PATH, resolution=SOURCE_RESOLUTI
     return land
 
 
-def generate_gshhg_land_fraction(
+def generate_osm_land_fraction(
     source=SOURCE_MASK_PATH,
     output=LAND_FRACTION_PATH,
     source_resolution=SOURCE_RESOLUTION,
     output_resolution=FRACTION_RESOLUTION,
     radius_km=100.0,
 ):
-    """Offline spherical-cap averaging, using the repository's reference kernel."""
+    """Area-weighted spherical-cap average, using existing STORM-L kernel."""
     from CODE.land_fraction import _compute_area_weighted
 
-    if radius_km != 100:
-        raise ValueError("Update filename/model metadata when changing radius_km")
+    if radius_km != 100.0:
+        raise ValueError("New radius requires new coefficient and raster contract")
+    source = Path(source)
+    source_meta = json.loads(source.with_suffix(".json").read_text(encoding="utf-8"))
+    if source_meta.get("resolution_deg") != source_resolution:
+        raise ValueError("Intermediate source resolution mismatch")
     land = unpack_source_for_fraction(source, source_resolution)
     ny, nx = land.shape
     lat_in = -90 + (np.arange(ny) + 0.5) * source_resolution
@@ -287,27 +353,30 @@ def generate_gshhg_land_fraction(
     lon_out = (np.arange(round(360 / output_resolution)) + 0.5) * output_resolution
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    dst = np.lib.format.open_memmap(
-        output, mode="w+", dtype=np.float32, shape=(len(lat_out), len(lon_out))
-    )
-    # Calculate one latitude band at a time; no 104-MB output ndarray.
-    # The heavy spherical convolution is a one-time offline operation.
-    output_rows_per_chunk = 64
+    output.with_suffix(".json").unlink(missing_ok=True)
+    staging = output.with_name(f"{output.stem}.building.npy")
     try:
-        for start in range(0, len(lat_out), output_rows_per_chunk):
-            stop = min(len(lat_out), start + output_rows_per_chunk)
-            dst[start:stop] = _compute_area_weighted(
-                lat_in, lon_in, land, lat_out[start:stop], lon_out, radius_km
-            )
-            if start % (output_rows_per_chunk * 10) == 0:
-                print(f"  {output.name}: {stop}/{len(lat_out)} output latitude rows")
-    finally:
-        dst.flush()
-        del dst
-    output.with_suffix(".json").write_text(
-        json.dumps(
+        dst = np.lib.format.open_memmap(
+            staging, mode="w+", dtype=np.float32, shape=(len(lat_out), len(lon_out))
+        )
+        try:
+            for start in range(0, len(lat_out), 64):
+                stop = min(len(lat_out), start + 64)
+                dst[start:stop] = _compute_area_weighted(
+                    lat_in, lon_in, land, lat_out[start:stop], lon_out, radius_km
+                )
+                if start % 640 == 0:
+                    print(f"  {output.name}: {stop}/{len(lat_out)} rows", flush=True)
+        finally:
+            dst.flush()
+            del dst
+        os.replace(staging, output)
+        _atomic_json(
+            output.with_suffix(".json"),
             {
-                "source": "GSHHG 2.3.7 GSHHS_f_L1",
+                "source": SOURCE_NAME,
+                "source_url": source_meta["source_url"],
+                "source_sha256": source_meta["source_sha256"],
                 "lakes": "land",
                 "method": "source-cell-centre spherical-cap, area weighted",
                 "radius_km": radius_km,
@@ -316,67 +385,76 @@ def generate_gshhg_land_fraction(
                 "shape": [len(lat_out), len(lon_out)],
                 "grid": "latitude increasing / longitude [0,360), cell centres",
             },
-            indent=2,
         )
-    )
+    finally:
+        staging.unlink(missing_ok=True)
     return output
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Build binary and fractional geography rasters from GSHHG Full L1."
+        description="Build memory-mapped binary and fractional masks using OSM land polygons"
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
-        "--download",
-        action="store_true",
-        help="Download GSHHG 2.3.7 if needed, verify SHA-256 and extract L1",
+        "--download", action="store_true", help="Get OSM split-WGS84 land polygons"
     )
     source.add_argument(
-        "--shapefile",
-        type=Path,
-        help="Use an existing GSHHS_f_L1.shp (with its .shx/.dbf/.prj files)",
+        "--shapefile", type=Path, help="Use existing land_polygons.shp (EPSG:4326)"
     )
+    parser.add_argument("--download-dir", type=Path, default=DEFAULT_DOWNLOAD_DIR)
     parser.add_argument(
-        "--download-dir",
-        type=Path,
-        default=DEFAULT_DOWNLOAD_DIR,
-        help=f"Cache for downloaded GSHHG archive and shapefile (default: {DEFAULT_DOWNLOAD_DIR})",
-    )
-    parser.add_argument(
-        "--force-download",
-        action="store_true",
-        help="Re-download and verify even if an extracted shapefile exists",
+        "--force-download", action="store_true", help="Refresh rolling OSM source"
     )
     parser.add_argument(
         "--download-only",
         action="store_true",
-        help="Download/verify/extract without building the expensive global rasters",
+        help="Download/extract; no rasterization",
+    )
+    parser.add_argument(
+        "--skip-fraction",
+        action="store_true",
+        help="Build both binary grids, no 100 km convolution",
     )
     parser.add_argument("--stripe-rows", type=int, default=200)
-    parser.add_argument("--skip-fraction", action="store_true")
     args = parser.parse_args(argv)
     if (args.force_download or args.download_only) and not args.download:
         parser.error("--force-download and --download-only require --download")
-    if args.stripe_rows <= 0:
-        parser.error("--stripe-rows must be a positive integer")
+    if args.stripe_rows < 1:
+        parser.error("--stripe-rows must be >= 1")
 
-    shapefile = (
-        ensure_gshhg_shapefile(args.download_dir, force_download=args.force_download)
-        if args.download
-        else args.shapefile
-    )
-    if not _shapefile_complete(shapefile):
-        parser.error(f"Missing .shp/.shx/.dbf/.prj components for {shapefile}")
+    if args.download:
+        shapefile, provenance = ensure_osm_shapefile(
+            args.download_dir, force_download=args.force_download
+        )
+    else:
+        shapefile = args.shapefile
+        provenance = _local_source_info(shapefile)
     if args.download_only:
-        print(f"Verified/extracted GSHHG shapefile: {shapefile}")
+        print(f"OSM coastline ready: {shapefile}")
         return
 
-    rasterize_gshhg_l1(shapefile, LAND_MASK_PATH, BINARY_RESOLUTION, args.stripe_rows)
-    rasterize_gshhg_l1(shapefile, SOURCE_MASK_PATH, SOURCE_RESOLUTION, args.stripe_rows)
+    rasterize_osm_land(
+        shapefile,
+        LAND_MASK_PATH,
+        BINARY_RESOLUTION,
+        args.stripe_rows,
+        provenance=provenance,
+    )
+    rasterize_osm_land(
+        shapefile,
+        SOURCE_MASK_PATH,
+        SOURCE_RESOLUTION,
+        args.stripe_rows,
+        provenance=provenance,
+    )
     if not args.skip_fraction:
-        generate_gshhg_land_fraction()
-    print("GSHHG geography generated in", GEOGRAPHY_DIR)
+        generate_osm_land_fraction()
+    print(f"OSM geography generated: {GEOGRAPHY_DIR}")
+    if not args.skip_fraction:
+        from CODE.geography import require_geography
+
+        print("Geography fingerprint:", require_geography()["source_sha256"])
 
 
 if __name__ == "__main__":

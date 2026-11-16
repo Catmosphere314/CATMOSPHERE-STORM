@@ -7,7 +7,7 @@ This is the script for generating the genesis matrices in Python 3 (with Cartopy
 import numpy as np
 import os
 import sys
-from CODE.geography import is_land as gshhg_is_land
+from CODE.geography import is_land as osm_is_land
 import pandas as pd
 from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
@@ -51,7 +51,7 @@ def basin_cell_centers(basin, rows, cols):
 __location__ = os.path.realpath(os.getcwd())  # TEMP FIX?
 dir_path = __location__
 # No Natural Earth polygon union or 0.1-degree legacy mask at import time.
-# All genesis spatial filtering uses the shared GSHHG 0.01-degree mask.
+# All genesis spatial filtering uses the shared OpenStreetMap 0.01-degree mask.
 
 
 def BOUNDARIES_BASINS(idx):
@@ -76,7 +76,7 @@ def _genesis_ocean_mask_1deg(basin, shape):
 
     A 10x10 sub-cell sample is sufficient for this coarse probability mask;
     the final genesis coordinates and every simulated track lookup use the
-    underlying GSHHG 0.01-degree binary classifier directly.
+    underlying OpenStreetMap 0.01-degree binary classifier directly.
     """
     rows, cols = shape
     lat0, lat1, lon0, lon1 = BOUNDARIES_BASINS(basin)
@@ -87,7 +87,7 @@ def _genesis_ocean_mask_1deg(basin, shape):
         np.arange(cols)[:, None] + (np.arange(10)[None, :] + 0.5) / 10
     )
     LAT, LON = np.meshgrid(lat_centres.ravel(), lon_centres.ravel(), indexing="ij")
-    covered = gshhg_is_land(LAT, LON).reshape(rows, 10, cols, 10).mean(axis=(1, 3))
+    covered = osm_is_land(LAT, LON).reshape(rows, 10, cols, 10).mean(axis=(1, 3))
     ocean = covered < 0.5
 
     lats = lat1 - (np.arange(rows) + 0.5)
@@ -176,7 +176,7 @@ def create_1deg_grid(delta_count_matrix, basin, month):
     grid = np.flipud(grid)
     grid[grid < 0] = 0
 
-    # GSHHG-derived 1-degree ocean admissibility; mask local genesis weights.
+    # OpenStreetMap-derived 1-degree ocean admissibility; mask local genesis weights.
     ocean = _genesis_ocean_mask_1deg(basin, grid.shape)
     grid[~ocean] = 0.0
 

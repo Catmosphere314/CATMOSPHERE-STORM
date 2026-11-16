@@ -44,7 +44,7 @@ def Check_EP_formation(lat, lon):
 
 
 def Check_if_landfall(lat, lon, basin=None, land_mask=None):
-    """Compatibility wrapper: authoritative GSHHG 0.01-degree classification."""
+    """Compatibility wrapper: authoritative OpenStreetMap 0.01-degree classification."""
     return is_land(lat, lon)
 
 

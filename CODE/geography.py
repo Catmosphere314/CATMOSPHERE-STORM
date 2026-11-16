@@ -1,8 +1,8 @@
-"""Shared GSHHG L1 geography lookups, loaded as read-only memory maps.
+"""Shared OpenStreetMap coastline-derived geography lookups, loaded as read-only memory maps.
 
 Binary mask: 0.01-degree north-up, longitude [-180,180), packed MSB first.
 Fraction: 0.05-degree cell-centre grid, south-up, longitude [0,360).
-Inland lakes deliberately count as land (GSHHG L1 only).
+Inland lakes count as land (OSM coastline land polygons exclude inland-water holes).
 """
 
 from __future__ import annotations
@@ -11,10 +11,57 @@ from pathlib import Path
 import numpy as np
 
 GEOGRAPHY_DIR = Path(__file__).resolve().parents[1] / "geography"
-LAND_MASK_PATH = GEOGRAPHY_DIR / "gshhg_f_L1_land_0p01_packed.npy"
-LAND_FRACTION_PATH = GEOGRAPHY_DIR / "gshhg_f_L1_landfrac_r100_0p05.npy"
+LAND_MASK_PATH = GEOGRAPHY_DIR / "osm_land_0p01_packed.npy"
+LAND_FRACTION_PATH = GEOGRAPHY_DIR / "osm_landfrac_r100_0p05.npy"
 BINARY_RESOLUTION = 0.01
 FRACTION_RESOLUTION = 0.05
+
+
+def geography_provenance():
+    """Small, matching metadata for binary/fraction rasters (no raster hashing at runtime).
+
+    Prevents accidentally mixing masks generated from different OSM snapshots.
+    The ZIP SHA-256 was calculated during offline acquisition; preserve the
+    cached source ZIP to reproduce that snapshot.
+    """
+    import json
+
+    profiles = []
+    for path in (LAND_MASK_PATH, LAND_FRACTION_PATH):
+        metadata_file = path.with_suffix(".json")
+        if not path.is_file() or not metadata_file.is_file():
+            raise FileNotFoundError(
+                f"Missing {path} or {metadata_file}; run python -m CODE.build_geography --download"
+            )
+        with metadata_file.open(encoding="utf-8") as handle:
+            meta = json.load(handle)
+        if meta.get("source") != "OpenStreetMap / osmdata land polygons":
+            raise ValueError(f"Unexpected land-mask source: {metadata_file}")
+        if meta.get("lakes") != "land":
+            raise ValueError(f"Inland-lake convention differs: {metadata_file}")
+        profiles.append(meta)
+
+    mask_meta, fraction_meta = profiles
+    if mask_meta.get("resolution_deg") != BINARY_RESOLUTION:
+        raise ValueError("Incorrect binary geography resolution")
+    if fraction_meta.get("output_resolution_deg") != FRACTION_RESOLUTION:
+        raise ValueError("Incorrect land-fraction output resolution")
+    if fraction_meta.get("radius_km") != 100.0:
+        raise ValueError("Expected a 100 km exposure radius")
+    token = mask_meta.get("source_sha256")
+    if not token or token != fraction_meta.get("source_sha256"):
+        raise ValueError(
+            "Binary and fractional masks come from different coastline snapshots"
+        )
+    return {
+        "source": mask_meta["source"],
+        "source_sha256": token,
+        "lakes": "land",
+        "binary_resolution_deg": BINARY_RESOLUTION,
+        "fraction_source_resolution_deg": fraction_meta.get("source_resolution_deg"),
+        "fraction_resolution_deg": FRACTION_RESOLUTION,
+        "radius_km": 100.0,
+    }
 
 
 @lru_cache(maxsize=4)
@@ -24,7 +71,7 @@ def _open_mmap(path: str):
 
 
 def is_land(lat, lon, *, path=LAND_MASK_PATH, resolution=BINARY_RESOLUTION):
-    """Classify point(s) on a GSHHG L1 bit-packed raster; scalar or array.
+    """Classify point(s) on a OSM bit-packed coastline raster; scalar or array.
 
     Out-of-range/NaN input raises rather than silently classifying ocean.
     Pixel lookup uses the containing cell, not an interpolated coastline.
@@ -84,9 +131,5 @@ def get_land_fraction(
 
 
 def require_geography():
-    missing = [str(p) for p in (LAND_MASK_PATH, LAND_FRACTION_PATH) if not p.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            "Generate GSHHG rasters before preprocessing/simulation: "
-            + ", ".join(missing)
-        )
+    """Validate both products and their common coastline snapshot."""
+    return geography_provenance()

@@ -126,7 +126,7 @@ def find_lat_index_bins(basin, lat):
 
 
 def Check_if_landfall(lat, lon, lat1=None, lon0=None, land_mask=None):
-    """Compatibility wrapper using shared GSHHG 0.01-degree binary mask."""
+    """Compatibility wrapper using shared OpenStreetMap 0.01-degree binary mask."""
     return is_land(lat, lon)
 
 

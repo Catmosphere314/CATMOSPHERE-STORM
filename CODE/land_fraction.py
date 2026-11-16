@@ -321,14 +321,14 @@ def get_land_fraction(
     path: str | Path = LAND_FRACTION_PATH,
     raster: xr.DataArray | None = None,
 ):
-    """Vectorized cyclic interpolation; GSHHG .npy mmap is production default.
+    """Vectorized cyclic interpolation; OpenStreetMap .npy mmap is production default.
 
     Passing a .nc path or an explicit xarray raster retains the legacy API.
     """
     if raster is None and Path(path).suffix == ".npy":
-        from CODE.geography import get_land_fraction as get_gshhg_fraction
+        from CODE.geography import get_land_fraction as get_osm_fraction
 
-        return get_gshhg_fraction(lat, lon, path=path)
+        return get_osm_fraction(lat, lon, path=path)
     if raster is None:
         raster = load_land_fraction(str(path))
     values = raster.values
@@ -361,5 +361,5 @@ def get_land_fraction(
 
 if __name__ == "__main__":
     raise SystemExit(
-        "For production GSHHG files run: python -m CODE.build_geography --shapefile /path/GSHHS_f_L1.shp"
+        "For production OSM coastlines run: python -m CODE.build_geography --download"
     )

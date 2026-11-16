@@ -1,4 +1,4 @@
-"""Compare GSHHG land flags with historical IBTrACS and legacy STORM masks.
+"""Compare OSM land flags with historical IBTrACS and legacy STORM masks.
 
     python -m CODE.validate_geography --ibtracs IBTrACS.1980_2025v04r01.nc
 
@@ -42,7 +42,7 @@ def compare_ibtracs(ibtracs_file, legacy_dir="Land_ocean_masks"):
         )
     df = df.loc[np.isfinite(df["lat"]) & np.isfinite(df["lon"])].copy()
     df["Basin"] = df["basin"].map(decode)
-    df["GSHHG"] = is_land(df["lat"].to_numpy(), df["lon"].to_numpy())
+    df["OSM"] = is_land(df["lat"].to_numpy(), df["lon"].to_numpy())
     df["IBTrACS"] = df["dist2land"].eq(0)
     df["Landfrac"] = get_land_fraction(df["lat"].to_numpy(), df["lon"].to_numpy())
     df["Legacy"] = np.nan
@@ -69,20 +69,20 @@ def compare_ibtracs(ibtracs_file, legacy_dir="Land_ocean_masks"):
         if basin not in BOUNDS:
             continue
         observed = g["IBTrACS"].to_numpy(dtype=bool)
-        predicted = g["GSHHG"].to_numpy(dtype=bool)
+        predicted = g["OSM"].to_numpy(dtype=bool)
         old = g["Legacy"].to_numpy(dtype=float)
         valid = np.isfinite(old)
         results.append(
             {
                 "Basin": basin,
                 "N_positions": len(g),
-                "GSHHG_vs_IBTrACS_percent": 100 * np.mean(observed != predicted),
-                "GSHHG_vs_legacy_percent": 100
+                "OSM_vs_IBTrACS_percent": 100 * np.mean(observed != predicted),
+                "OSM_vs_legacy_percent": 100
                 * np.mean(predicted[valid] != old[valid].astype(bool))
                 if np.any(valid)
                 else np.nan,
                 "N_legacy_positions": int(valid.sum()),
-                "N_GSHHG_inland": int(predicted.sum()),
+                "N_OSM_inland": int(predicted.sum()),
                 "N_IBTrACS_inland": int(observed.sum()),
             }
         )
@@ -93,7 +93,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ibtracs", type=Path, required=True)
     p.add_argument("--legacy-dir", default="Land_ocean_masks")
-    p.add_argument("--output", default="gshhg_ibtracs_mask_comparison.csv")
+    p.add_argument("--output", default="osm_ibtracs_mask_comparison.csv")
     args = p.parse_args()
     summary, df = compare_ibtracs(args.ibtracs, args.legacy_dir)
     print(summary.to_string(index=False))
