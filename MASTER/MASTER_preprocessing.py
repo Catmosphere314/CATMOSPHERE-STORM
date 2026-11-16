@@ -25,6 +25,7 @@ from CODE.decay import (
     fit_decay_model,
     save_decay_parameters,
     DEFAULT_DECAY_PARAMETERS_PATH,
+    _decode_agency,
 )
 
 __location__ = os.path.realpath(os.getcwd())  # TEMP FIX FOR MASTER FOLDER?
@@ -69,13 +70,19 @@ df1 = data.to_dataframe()[
         "usa_rmw",
     ]
 ]
-df1["wmo_wind"] = df1["wmo_wind"] * 0.51444444
-df1 = df1[df1["wmo_wind"] >= 18]
+
+
+df1["wind_ms"] = [
+    preprocessing.convert_wind_speed(w * 0.51444444, _decode_agency(a))
+    for w, a in zip(df1["wmo_wind"], df1["wmo_agency"])
+]
+df1 = df1.loc[df1["wind_ms"] >= preprocessing.TS_THRESHOLD_MS]
+
 nyear = []
 for basin in [b"EP", b"NA", b"NI", b"SI", b"SP", b"WP"]:
     nyear.append(len(np.unique(df1[df1["basin"] == basin]["season"].values)))
 years = np.unique(data.season.values)
-print("number of years: ", int(len(years)), "from", years[0], "to", years[-1])
+print("number of years: ", len(years), "from", years[0], "to", years[-1])
 preprocessing.extract_data(data, int(years[-1]))
 print("extract_data done")
 

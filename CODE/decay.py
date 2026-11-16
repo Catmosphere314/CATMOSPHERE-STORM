@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 
 from CODE.land_fraction import get_land_fraction, LAND_FRACTION_PATH
+from CODE.preprocessing import convert_wind_speed
+from CODE.siena_utils import TS_THRESHOLD_MS
 
 
 __location__ = os.getcwd()
@@ -135,6 +137,10 @@ def _haversine_km(lat0, lon0, lat, lon):
     a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
     return 6371 * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
+def _decode_agency(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8").strip()
+    return str(value).strip()
 
 def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
 
@@ -159,8 +165,12 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
             "usa_rmw",
         ]
     ]
-    df1["wmo_wind"] = df1["wmo_wind"] * 0.51444444
-    df = df1[df1["wmo_wind"] >= 18]
+    df1["wind_ms"] = [
+        convert_wind_speed(w * 0.51444444, decode_agency(a))
+        for w, a in zip(df1["wmo_wind"], df1["wmo_agency"])
+    ]
+
+    df = df1.loc[df1["wind_ms"] >= TS_THRESHOLD_MS].copy()
 
     # Decode byte strings
     def decode_string(x):
@@ -176,8 +186,6 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
         df["iso_time"].map(decode_string),
         errors="coerce",
     )
-
-    df["wind_ms"] = df["wmo_wind"]  # * 0.51444444
 
     # Keep main storm tracks
     df = df[df["track_type"] == "main"].copy()
@@ -211,7 +219,7 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
             # Minimum tropical-storm intensity at landfall
             v0 = previous["wind_ms"]
 
-            if not np.isfinite(v0) or v0 < 18:
+            if not np.isfinite(v0) or v0 < TS_THRESHOLD_MS:
                 continue
 
             # Continue until the storm leaves land
