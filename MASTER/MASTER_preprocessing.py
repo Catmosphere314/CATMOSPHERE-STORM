@@ -20,8 +20,15 @@ import CODE.genesis_matrix as genesis_matrix
 import CODE.import_data as import_data
 from CODE.siena_utils import load_climate_index_table, count_phase_months
 from CODE.validate_twopn import validate_residuals
+from CODE.decay import (
+    extract_landfall_episodes,
+    fit_decay_model,
+    save_decay_parameters,
+    DEFAULT_DECAY_PARAMETERS_PATH,
+    _decode_agency,
+)
 
-__location__ = os.path.realpath(os.getcwd()) # TEMP FIX FOR MASTER FOLDER?
+__location__ = os.path.realpath(os.getcwd())  # TEMP FIX FOR MASTER FOLDER?
 dir_path = __location__
 
 
@@ -63,16 +70,32 @@ df1 = data.to_dataframe()[
         "usa_rmw",
     ]
 ]
-df1["wmo_wind"] = df1["wmo_wind"] * 0.51444444
-df1 = df1[df1["wmo_wind"] >= 18]
+
+
+df1["wind_ms"] = [
+    preprocessing.convert_wind_speed(w * 0.51444444, _decode_agency(a))
+    for w, a in zip(df1["wmo_wind"], df1["wmo_agency"])
+]
+df1 = df1.loc[df1["wind_ms"] >= preprocessing.TS_THRESHOLD_MS]
+
 nyear = []
 for basin in [b"EP", b"NA", b"NI", b"SI", b"SP", b"WP"]:
     nyear.append(len(np.unique(df1[df1["basin"] == basin]["season"].values)))
 years = np.unique(data.season.values)
-print("number of years: ", int(len(years)), "from", years[0], "to", years[-1])
+print("number of years: ", len(years), "from", years[0], "to", years[-1])
 preprocessing.extract_data(data, int(years[-1]))
-data.close()
 print("extract_data done")
+
+# Fit STORM-L against the SAME IBTrACS dataset used for other coefficients.
+# The precomputed land-fraction NetCDF must exist before this step.
+print("********************************")
+print("Fitting STORM-L landfall-decay coefficients")
+landfall_episodes = extract_landfall_episodes(data)
+decay_basins = ["EP", "NA", "NI", "SI", "SP", "WP"]
+decay_parameters = fit_decay_model(landfall_episodes, decay_basins)
+save_decay_parameters(decay_parameters, DEFAULT_DECAY_PARAMETERS_PATH)
+print(f"STORM-L parameters saved to {DEFAULT_DECAY_PARAMETERS_PATH}")
+data.close()
 
 # ============================================================================
 # Load ONI / climate index table
