@@ -9,13 +9,17 @@ from scipy.optimize import least_squares
 import json
 from pathlib import Path
 
-from CODE.land_fraction import get_land_fraction
+from CODE.land_fraction import get_land_fraction, LAND_FRACTION_PATH
 
 
 __location__ = os.getcwd()
 
 
-WEIGHTS_PRESENT_FUTURE = [0.2, 0.8]  # weights for current and next land fraction
+WEIGHTS_PRESENT_FUTURE = [0.2, 0.8]  # calibration and simulator must match
+DEFAULT_DECAY_PARAMETERS_PATH = (
+    Path(__file__).resolve().parents[1] / "DATA" / "parameters" / "storm_l_decay.json"
+)
+
 
 def save_decay_parameters(parameters, filepath):
     filepath = Path(filepath)
@@ -24,6 +28,8 @@ def save_decay_parameters(parameters, filepath):
     payload = {
         "schema_version": 1,
         "land_fraction_weights": WEIGHTS_PRESENT_FUTURE,
+        "radius_km": 100,
+        "land_fraction_raster": str(LAND_FRACTION_PATH),
         "basins": parameters,
     }
 
@@ -37,8 +43,13 @@ def load_decay_parameters(filepath):
 
     if payload["land_fraction_weights"] != WEIGHTS_PRESENT_FUTURE:
         raise ValueError("Land-fraction weighting differs from calibration")
+    if payload.get("radius_km") != 100:
+        raise ValueError("STORM-L parameters expect a 100 km land-fraction radius")
+    if payload.get("land_fraction_raster") != str(LAND_FRACTION_PATH):
+        raise ValueError("Calibration and simulator land-fraction raster paths differ")
 
     return payload["basins"]
+
 
 def _prepare_decay_df(landfall_df, max_gap_hours=6):
     """Convert landfall episodes into a DataFrame suitable for decay model calibration."""
@@ -243,9 +254,7 @@ def extract_landfall_episodes(ibtracs, min_steps=2, max_hours=48):
     if not segments:
         return []
 
-    landfall_df = pd.concat(
-        segments, ignore_index=True
-    )
+    landfall_df = pd.concat(segments, ignore_index=True)
 
     landfall_df["land_fraction"] = get_land_fraction(
         landfall_df["lat"].to_numpy(),
@@ -345,6 +354,7 @@ def predict_storm_l(v0_ms, T_l_hours, D_km, params):
 
     return v * kt_to_ms
 
+
 def predict_storm_landfrac(
     episode, alpha=0.095, t0=100.0, r=0.9, c1=0.0109, d1=-0.0503
 ):
@@ -366,7 +376,7 @@ def predict_storm_landfrac(
     )
 
 
-def fit_STORM_landfrac(train : pd.DataFrame):
+def fit_STORM_landfrac(train: pd.DataFrame):
     """Training the STORM-L decay model to landfall episodes using least-squares optimization."""
 
     n_episodes = Counter(episode["sid"] for episode in train)
@@ -408,9 +418,7 @@ def fit_STORM_landfrac(train : pd.DataFrame):
     )
 
     if not opt.success:
-        raise RuntimeError(
-            f"STORM-L fitting failed: {opt.message}"
-        )
+        raise RuntimeError(f"STORM-L fitting failed: {opt.message}")
 
     return (
         float(np.exp(opt.x[0])),
@@ -437,24 +445,17 @@ def evaluate(test, predict_fn):
 
 
 def fit_decay_model(
-    episodes: pd.DataFrame, basins: list[str],*, evaluate_fn:bool=False
+    episodes: list[dict], basins: list[str], *, evaluate_fn: bool = False
 ) -> dict[str, dict[str, float]]:
     """Fit the STORM-L decay model to landfall episodes for each basin."""
     parameters = {}
     for basin in basins:
-        basin_episodes = [
-            ep for ep in episodes
-            if ep["basin"] == basin
-        ]
+        basin_episodes = [ep for ep in episodes if ep["basin"] == basin]
 
         if not basin_episodes:
-            raise ValueError(
-                f"No episodes available for basin {basin}"
-            )
+            raise ValueError(f"No episodes available for basin {basin}")
 
-        alpha, r, c1, d1 = fit_STORM_landfrac(
-            basin_episodes
-        )
+        alpha, r, c1, d1 = fit_STORM_landfrac(basin_episodes)
 
         parameters[basin] = {
             "model": "STORM-L",
@@ -469,11 +470,9 @@ def fit_decay_model(
         if evaluate_fn:
             results = evaluate(
                 basin_episodes,
-                lambda ep, alpha=alpha, r=r, c1=c1, d1=d1: predict_storm_landfrac(
-                    ep, alpha, r, c1, d1
+                lambda ep, p=parameters[basin]: predict_storm_l(
+                    ep["v0"], np.cumsum(ep["dt"] * ep["L"]), ep["d"], p
                 ),
             )
             print(basin, results)
     return parameters
-
-
