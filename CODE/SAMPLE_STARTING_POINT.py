@@ -7,6 +7,7 @@ import os
 from CODE.SELECT_BASIN import Basins_WMO
 from CODE.siena_utils import normalize_phase
 from CODE.genesis_matrix import _blend_genesis_with_env, compute_gpi_field
+from CODE.geography import is_land
 
 __location__ = os.path.realpath(os.getcwd())  # TEMP FIX?
 dir_path = __location__
@@ -42,11 +43,9 @@ def Check_EP_formation(lat, lon):
     return lat >= lat_isthmus
 
 
-def Check_if_landfall(lat, lon, basin, land_mask):
-    s, monthdummy, lat0_WMO, lat1_WMO, lon0_WMO, lon1_WMO = Basins_WMO(basin)
-    x = int(10 * (lon - lon0_WMO))
-    y = int(10 * (lat1_WMO - lat))
-    return land_mask[y, x]
+def Check_if_landfall(lat, lon, basin=None, land_mask=None):
+    """Compatibility wrapper: authoritative OpenStreetMap 0.01-degree classification."""
+    return is_land(lat, lon)
 
 
 def _build_weighted_index(grid_copy, round_coeff=4):
@@ -68,19 +67,6 @@ def _build_weighted_index(grid_copy, round_coeff=4):
             if value > 0:
                 weighted_list_index.extend([i * (ncols) + j] * value)
     return weighted_list_index, grid_copy
-
-
-_LAND_MASK_CACHE_SP = {}
-
-
-def _get_land_mask_sp(basin):
-    if basin not in _LAND_MASK_CACHE_SP:
-        _LAND_MASK_CACHE_SP[basin] = np.loadtxt(
-            os.path.join(
-                dir_path, "Land_ocean_masks/Land_ocean_mask_" + str(basin) + ".txt"
-            )
-        )
-    return _LAND_MASK_CACHE_SP[basin]
 
 
 def Startingpoint(
@@ -112,7 +98,6 @@ def Startingpoint(
     lon_coordinates = []
     lat_coordinates = []
     s, monthdummy, lat0, lat1, lon0, lon1 = Basins_WMO(basin, phase=phase)
-    land_mask = _get_land_mask_sp(basin)
 
     for month in monthlist:
         effective_phase = phase
@@ -201,12 +186,15 @@ def Startingpoint(
             idx0 = random.choice(weighted_list_index)
             row = int(np.floor(idx0 / (ncols)))
             col = int(idx0 % (ncols))
-            lat_pert = random.uniform(0, 0.99)
-            lon_pert = random.uniform(0, 0.99)
-            lon_pt = lon0 + round(col + lon_pert, 2)
-            lat_pt = lat1 - round(row + lat_pert, 2)
+            # Uniform selection among the 100 x 100 sub-cells of the
+            # 1-degree genesis bin; test the exact 0.01-degree pixel centre.
+            # This avoids endpoint rounding bias and 0.1-degree mask aliasing.
+            lat_pert = (random.randrange(100) + 0.5) / 100
+            lon_pert = (random.randrange(100) + 0.5) / 100
+            lon_pt = lon0 + col + lon_pert
+            lat_pt = lat1 - row - lat_pert
             if lon_pt < lon1 and lat_pt < lat1:
-                check = Check_if_landfall(lat_pt, lon_pt, basin, land_mask)
+                check = Check_if_landfall(lat_pt, lon_pt, basin)
                 if basin == "EP":
                     check = check or Check_EP_formation(lat_pt, lon_pt)
                 if basin == "NA":

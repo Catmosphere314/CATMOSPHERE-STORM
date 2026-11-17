@@ -20,6 +20,7 @@ import CODE.genesis_matrix as genesis_matrix
 import CODE.import_data as import_data
 from CODE.siena_utils import load_climate_index_table, count_phase_months
 from CODE.validate_twopn import validate_residuals
+from CODE.geography import require_geography
 from CODE.decay import (
     extract_landfall_episodes,
     fit_decay_model,
@@ -45,6 +46,7 @@ dir_path = __location__
     genesis_weighting,
 ) = import_data.input_data("input.dat")
 
+require_geography()  # Fail before hours of preprocessing if mask files are missing
 TC_file = "IBTrACS." + str(period[0]) + "_" + str(period[1]) + "v04r01.nc"
 print("********************************")
 data = xr.open_dataset(os.path.join(__location__, TC_file), decode_times=False)
@@ -61,6 +63,7 @@ df1 = data.to_dataframe()[
         "name",
         "iso_time",
         "wmo_wind",
+        "wmo_agency",
         "wmo_pres",
         "track_type",
         "main_track_sid",

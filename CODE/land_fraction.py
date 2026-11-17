@@ -21,8 +21,12 @@ import warnings
 import numpy as np
 import xarray as xr
 
-LAND_MASK_PATH = Path("/home/mbaldacchino/data/era5_land_sea_mask.nc")
-LAND_FRACTION_PATH = Path("/home/mbaldacchino/data/land_fraction_r100_0.05deg.nc")
+# ERA5 inputs remain available only for reproducing the old comparison.
+ERA5_LAND_MASK_PATH = Path("/home/mbaldacchino/data/era5_land_sea_mask.nc")
+ERA5_LAND_FRACTION_PATH = Path("/home/mbaldacchino/data/land_fraction_r100_0.05deg.nc")
+from CODE.geography import LAND_FRACTION_PATH
+
+LAND_MASK_PATH = ERA5_LAND_MASK_PATH
 EARTH_RADIUS_KM = 6371.0088
 
 
@@ -261,7 +265,7 @@ def generate_land_fraction(
     lon_out = np.arange(round(360 / resolution), dtype=np.float64) * resolution
     if output_path is None:
         output_path = (
-            LAND_FRACTION_PATH.parent
+            ERA5_LAND_FRACTION_PATH.parent
             / f"land_fraction_r{radius_km:g}_{resolution:g}deg.nc"
         )
     # Classic NetCDF has file-size restrictions. Choose a NetCDF4 backend
@@ -303,7 +307,7 @@ def generate_land_fraction(
 
 
 @lru_cache(maxsize=2)
-def load_land_fraction(path: str | Path = LAND_FRACTION_PATH) -> xr.DataArray:
+def load_land_fraction(path: str | Path = ERA5_LAND_FRACTION_PATH) -> xr.DataArray:
     """Load output raster once per process; subsequent queries use memory."""
     with xr.open_dataset(path) as ds:
         field = ds["land_fraction"].load()
@@ -317,7 +321,14 @@ def get_land_fraction(
     path: str | Path = LAND_FRACTION_PATH,
     raster: xr.DataArray | None = None,
 ):
-    """Vectorized, cyclic bilinear interpolation. Scalars in, float out."""
+    """Vectorized cyclic interpolation; OpenStreetMap .npy mmap is production default.
+
+    Passing a .nc path or an explicit xarray raster retains the legacy API.
+    """
+    if raster is None and Path(path).suffix == ".npy":
+        from CODE.geography import get_land_fraction as get_osm_fraction
+
+        return get_osm_fraction(lat, lon, path=path)
     if raster is None:
         raster = load_land_fraction(str(path))
     values = raster.values
@@ -349,4 +360,6 @@ def get_land_fraction(
 
 
 if __name__ == "__main__":
-    generate_land_fraction(radius_km=100, resolution=0.05)
+    raise SystemExit(
+        "For production OSM coastlines run: python -m CODE.build_geography --download"
+    )
