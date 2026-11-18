@@ -18,18 +18,17 @@ import pandas as pd
 import xarray as xr
 from scipy.ndimage import gaussian_filter
 
-from CODE.genesis_matrix import BOUNDARIES_BASINS, basin_cell_centers
 from CODE.geography import LAND_MASK_PATH, BINARY_RESOLUTION, is_land
 
 BASINS = ("NA", "WP", "EP", "NI", "SI", "SP")
 INDEX_TO_BASIN = dict(enumerate(("EP", "NA", "NI", "SI", "SP", "WP")))
 ACTIVE_MONTHS = {
-    "NA": (6, 7, 8, 9, 10, 11),
-    "WP": (5, 6, 7, 8, 9, 10, 11),
+    "NA": (5,6, 7, 8, 9, 10, 11,12),
+    "WP": (5, 6, 7, 8, 9, 10, 11,12),
     "EP": (6, 7, 8, 9, 10, 11),
-    "NI": (4, 5, 6, 9, 10, 11),
-    "SI": (1, 2, 3, 4, 11, 12),
-    "SP": (1, 2, 3, 4, 11, 12),
+    "NI": (1,2,3,4, 5, 6,7,8, 9, 10, 11,12),
+    "SI": (1, 2, 3, 4,5,9,10, 11, 12),
+    "SP": (1, 2, 3, 4,5,6,10, 11, 12),
 }
 OMEGA = 7.2921e-5
 EARTH_RADIUS_KM = 6371.0088
@@ -40,6 +39,36 @@ ETA_CLIP = {"NA": 3.5e-5, "WP": 4.5e-5, "EP": 3.5e-5,
 REGION_REFERENCE = {"NA": "subtropical", "WP": "scs", "EP": "subtropical",
                     "NI": "bay_of_bengal", "SI": "central_south_indian_ocean",
                     "SP": "central_south_pacific"}
+
+def BOUNDARIES_BASINS_GENESIS(idx):
+    if idx == "EP":  # Eastern Pacific
+        lat0, lat1, lon0, lon1 = 5, 35, 180, 285
+    if idx == "NA":  # North Atlantic
+        lat0, lat1, lon0, lon1 = 5, 35, 255, 360
+    if idx == "NI":  # North Indian
+        lat0, lat1, lon0, lon1 = 5, 35, 50, 100
+    if idx == "SI":  # South Indian
+        lat0, lat1, lon0, lon1 = -35, -5, 10, 135
+    if idx == "SP":  # South Pacific
+        lat0, lat1, lon0, lon1 = -35, -5, 135, 240
+    if idx == "WP":  # Western Pacific
+        lat0, lat1, lon0, lon1 = 5, 35, 100, 180
+
+    return lat0, lat1, lon0, lon1
+
+
+def basin_cell_centers_genesis(basin, rows, cols):
+    lat0, lat1, lon0, lon1 = BOUNDARIES_BASINS_GENESIS(basin)
+
+    dlat = (lat1 - lat0) / rows
+    dlon = (lon1 - lon0) / cols
+
+    # Grid is stored north-to-south.
+    lat = lat1 - (np.arange(rows) + 0.5) * dlat
+    lon = lon0 + (np.arange(cols) + 0.5) * dlon
+
+    LON, LAT = np.meshgrid(lon, lat)
+    return LAT, LON
 
 
 @dataclass(frozen=True)
@@ -57,7 +86,7 @@ class GenesisConfig:
 
     @property
     def bounds(self):
-        return BOUNDARIES_BASINS(self.basin)
+        return BOUNDARIES_BASINS_GENESIS(self.basin)
 
 
 def _load_dict(folder: Path, filename: str) -> dict:
@@ -165,9 +194,9 @@ def build_osm_exposure(basin: str, mask_path: Path = LAND_MASK_PATH, *, verify_m
     packed = np.load(path, mmap_mode="r", allow_pickle=False)
     if packed.shape != (18000, 4500) or packed.dtype != np.uint8:
         raise ValueError(f"Incorrect packed OSM mask geometry: {packed.shape}, {packed.dtype}")
-    lat0, lat1, lon0, lon1 = BOUNDARIES_BASINS(basin)
+    lat0, lat1, lon0, lon1 = BOUNDARIES_BASINS_GENESIS(basin)
     nlat, nlon = int(lat1 - lat0), int(lon1 - lon0)
-    LAT, LON = basin_cell_centers(basin, nlat, nlon)
+    LAT, LON = basin_cell_centers_genesis(basin, nlat, nlon)
     ocean_frac = np.empty((nlat, nlon), dtype=np.float32)
     eligible_frac = np.empty_like(ocean_frac)
     ocean_valid = np.empty((nlat, nlon), dtype=bool)
@@ -286,7 +315,7 @@ def load_basin_environment(env_dir: Path, cfg: GenesisConfig, *, include_w500: b
     path = Path(env_dir)
     lat0, lat1, lon0, lon1 = cfg.bounds
     nlat, nlon = int(lat1 - lat0), int(lon1 - lon0)
-    lat2, lon2 = basin_cell_centers(cfg.basin, nlat, nlon)
+    lat2, lon2 = basin_cell_centers_genesis(cfg.basin, nlat, nlon)
     lats, lons = lat2[:, 0], lon2[0, :]
     ilat = np.rint((90.0 - lats) / .25).astype(int)
     ilon = np.rint((lons % 360.0) / .25).astype(int) % 1440

@@ -70,9 +70,9 @@ def BOUNDARIES_BASINS(idx):
 
     return lat0, lat1, lon0, lon1
 
-
+OCEAN_FRAC_THRESHOLD = 0.2
 def _genesis_ocean_mask_1deg(basin, shape):
-    """Preserve the legacy <50%-land rule for each 1-degree genesis bin.
+    """Preserve the legacy <XX%-land rule for each 1-degree genesis bin.
 
     A 10x10 sub-cell sample is sufficient for this coarse probability mask;
     the final genesis coordinates and every simulated track lookup use the
@@ -88,7 +88,7 @@ def _genesis_ocean_mask_1deg(basin, shape):
     )
     LAT, LON = np.meshgrid(lat_centres.ravel(), lon_centres.ravel(), indexing="ij")
     covered = osm_is_land(LAT, LON).reshape(rows, 10, cols, 10).mean(axis=(1, 3))
-    ocean = covered < 0.5
+    ocean = covered < OCEAN_FRAC_THRESHOLD
 
     lats = lat1 - (np.arange(rows) + 0.5)
     lons = lon0 + (np.arange(cols) + 0.5)
