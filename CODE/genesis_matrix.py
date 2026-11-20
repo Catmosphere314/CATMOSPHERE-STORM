@@ -70,7 +70,10 @@ def BOUNDARIES_BASINS(idx):
 
     return lat0, lat1, lon0, lon1
 
+
 OCEAN_FRAC_THRESHOLD = 0.2
+
+
 def _genesis_ocean_mask_1deg(basin, shape):
     """Preserve the legacy <XX%-land rule for each 1-degree genesis bin.
 
@@ -816,9 +819,6 @@ def compute_gpi_field(basin, month, phase=None, env_year=None):
     return gpi / s
 
 
-
-
-
 ##################################################
 # ####   GLM    FITTING   ####
 ##################################################
@@ -845,7 +845,7 @@ def _formula_for_basin(basin: str, soft_regions: dict) -> str:
         )
     if basin == "WP":
         return (
-            "genesis_count ~ z_pi + z_rh600 + z_vws + z_eta_clip +"
+            "genesis_count ~ z_pi + z_rh600 + z_vws + z_eta_clip"
             + (" + " + " + ".join(terms) if terms else "")
             + " + z_eio_dynamic"
         )
@@ -872,7 +872,10 @@ from pathlib import Path
 import statsmodels.api as sm
 import joblib
 
-def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool = True) -> None:
+
+def genesis_glm_fitting(
+    idx_basin, months, period: tuple, *, save_prepared: bool = True
+):
     """
     Fit a Poisson regression model for each basin using the preprocessed data.
 
@@ -904,7 +907,7 @@ def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool 
             basin=b,
             start_year=period[0],
             end_year=period[1],
-            first_test_year=period[1],
+            first_test_year=period[1] + 1,  # production fit: use ALL historical years
         )
         for b in basins
     }
@@ -912,11 +915,9 @@ def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool 
     genesis_all = gd.load_first_ts_genesis(Path(__location__), basins)
     coarse_exposure = {basin: gd.build_osm_exposure(basin) for basin in basins}
 
-
     # Genesis boundaries are narrower than full storm/track boundaries by design.
     # Never compare against gm._genesis_ocean_mask_1deg(basin, shape): it uses
     # BOUNDARIES_BASINS (track bounds), so those grid rows represent other latitudes.
-
 
     for basin, ex in coarse_exposure.items():
         assert ex.attrs["coarse_max_land_fraction"] == gd.MAX_GENESIS_COARSE_LAND_FRAC
@@ -936,20 +937,27 @@ def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool 
     for basin, cfg in config_basins.items():
         print("Loading", basin, "...", flush=True)
         env_1deg[basin] = gd.load_basin_environment(
-            os.path.join(__location__,"env_yearly"),
+            os.path.join(__location__, "env_yearly"),
             cfg,
         )
 
     climate_extra = {b: None for b in basins}
     for basin in ("NA", "EP"):
         if basin in basins:
-            yearly_sst = gd.yearly_relative_sst(os.path.join(__location__,"env_yearly"), config_basins[basin])
-            climate_extra[basin] = gd.na_ep_climate_monthly(yearly_sst, config_basins[basin])
+            yearly_sst = gd.yearly_relative_sst(
+                os.path.join(__location__, "env_yearly"), config_basins[basin]
+            )
+            climate_extra[basin] = gd.na_ep_climate_monthly(
+                yearly_sst, config_basins[basin]
+            )
     if "WP" in basins:
-        climate_extra["WP"] = gd.wp_eio_dynamic(os.path.join(__location__,"Monthly_mean_SST.nc"), config_basins["WP"])
+        climate_extra["WP"] = gd.wp_eio_dynamic(
+            os.path.join(__location__, "Monthly_mean_SST.nc"), config_basins["WP"]
+        )
     if "SP" in basins:
-        climate_extra["SP"] = gd.sp_roni_monthly(os.path.join(__location__,"roni.csv"), config_basins["SP"])
-
+        climate_extra["SP"] = gd.sp_roni_monthly(
+            os.path.join(__location__, "roni.csv"), config_basins["SP"]
+        )
 
     model_df = {}
     for basin, cfg in config_basins.items():
@@ -974,11 +982,9 @@ def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool 
         model_df[basin] = df
         train[basin], test[basin], scalers[basin] = gd.standardize_train_test(df, cfg)
 
-
     formulas = {basin: _formula_for_basin(basin, soft_regions) for basin in basins}
     for basin, form in formulas.items():
         print(basin, "->", form)
-
 
     models = {}
     for basin in basins:
@@ -989,55 +995,52 @@ def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool 
             offset=train[basin].log_exposure,
         ).fit()
 
-
     if save_prepared:
         target = Path(__location__) / "genesis_prepared"
-        target.mkdir(exist_ok=True)
-        # for b in basins:
-        #     models[b].save(target / f"model_{b}.pkl")
-        #     coarse_exposure[b].to_netcdf(target / f"osm_genesis_exposure_{b}_1deg.nc")
-        #     np.save(target / f'scalers_{b}.npy',  scalers[b])
+        target.mkdir(parents=True, exist_ok=True)
+        from CODE.genesis_complementary import eio_monthly_reference
 
         for basin in basins:
-            models[basin].save(target / f"glm_{basin}.pkl")
+            model = models[basin]
+            # With a free intercept Poisson MLE must match the training total.
+            n_pred = gd.predict_cell_counts(model, train[basin]).sum()
+            n_obs = train[basin].genesis_count.sum()
+            if not np.isclose(n_pred, n_obs, rtol=1e-5, atol=1e-3):
+                raise AssertionError(
+                    f"{basin}: training calibration {n_pred} != {n_obs}"
+                )
 
-            joblib.dump(
-                {
-                    "scalers": scalers[basin],
-                    "formula": formulas[basin],
-                    "active_months": list(config_basins[basin].active_months),
-                    "genesis_bounds": list(config_basins[basin].bounds),
-                    "eta_clip": gd.ETA_CLIP[basin],
-                    "region_sigma": 3.0,
-                },
-                target / f"metadata_{basin}.joblib",
+            model.save(target / f"glm_{basin}.pkl")
+            reg_fields = {}
+            if basin in ("NA", "WP", "EP", "SI", "SP"):
+                reg_fields, _ = gd.static_region_weights(
+                    coarse_exposure[basin], config_basins[basin], sigma=3.0
+                )
+            np.savez_compressed(
+                target / f"regional_weights_{basin}.npz",
+                **reg_fields,
             )
-
-            coarse_exposure[basin].to_netcdf(target / f"osm_genesis_exposure_{basin}_1deg.nc")
-
+            meta = {
+                "scalers": scalers[basin],
+                "formula": formulas[basin],
+                "active_months": list(config_basins[basin].active_months),
+                "genesis_bounds": list(config_basins[basin].bounds),
+                "eta_clip": gd.ETA_CLIP[basin],
+                "region_sigma": 3.0,
+                "osm_sha256": coarse_exposure[basin].attrs["osm_sha256"],
+                "fit_period": [int(period[0]), int(period[1])],
+                "area_unit_km2": config_basins[basin].area_unit_km2,
+                "reference_month_days": config_basins[basin].reference_month_days,
+            }
+            if basin == "WP":
+                meta["eio_monthly_climatology"] = eio_monthly_reference(
+                    Path(__location__) / "Monthly_mean_SST.nc",
+                    int(period[0]),
+                    int(period[1]) + 1,
+                )
+            joblib.dump(meta, target / f"metadata_{basin}.joblib")
+            coarse_exposure[basin].to_netcdf(
+                target / f"osm_genesis_exposure_{basin}_1deg.nc"
+            )
         print("Saved:", target)
-
-
-
-
-target = Path(__location__) / "genesis_prepared"
-target.mkdir(parents=True, exist_ok=True)
-
-
-from typing import Any
-
-def _load_model_scalers(basin : str = "NA") -> tuple[Any, dict]:
-    """Load the previously fitted basin specific model."""
-    target = Path(__location__) / "genesis_prepared"
-    model = sm.load(target / f"model_{basin}.pkl")
-    scalers = np.load(target / f"scalers_{basin}.npy",allow_pickle='TRUE').item()
-    return model, scalers
-
-
-def _rescale_data(df: pd.DataFrame, scalers : dict) -> pd.DataFrame:
-    """Rescale the data according to the training scaler."""
-    scaled_df = df.copy()
-    for i in scalers.keys():
-        scaled_df["z_" + i] = (scaled_df[i] - scalers[i][0])/scalers[i][1]
-    return scaled_df
-
+    return models
