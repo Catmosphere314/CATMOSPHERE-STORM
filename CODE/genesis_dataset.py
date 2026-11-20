@@ -150,7 +150,7 @@ def load_first_ts_genesis(data_root: Path, basins: list = None) -> pd.DataFrame:
         else:
             name = str(raw_basin).upper()
         if (basins is not None) and (name not in basins):
-            continue  # Skip basins not requested by the caller 
+            continue  # Skip basins not requested by the caller
         if name not in BASINS:
             raise ValueError(f"Storm {sid}: unknown genesis basin {raw_basin!r}")
         mjd = float(times[sid][0])
@@ -584,7 +584,7 @@ def build_model_table(
     unobserved cells are audited and dropped; their potential exposure is not
     silently treated as observed absence. No event is replicated or lost.
     """
-    fields = ["pi", "rh600", "vws", "eta850"] 
+    fields = ["pi", "rh600", "vws", "eta850"]
     missing_fields = sorted(set(fields) - set(env.data_vars))
     if missing_fields:
         raise KeyError(f"{cfg.basin}: missing {missing_fields}")
@@ -690,10 +690,12 @@ def build_model_table(
     return model
 
 
-def smooth_region_weights(
-    model: pd.DataFrame, exposure: xr.Dataset, cfg: GenesisConfig, sigma: float = 3.0
-) -> tuple[pd.DataFrame, list[str]]:
-    """Fixed geographic soft memberships on full 1-degree mask, never from test events."""
+def static_region_weights(exposure: xr.Dataset, cfg: GenesisConfig, sigma: float = 3.0):
+    """Compute basin-specific static Gaussian memberships on the EXACT OSM grid.
+
+    Output arrays use the genesis 1-degree north-to-south row order. The same
+    function is used in fitting and persisted for production inference.
+    """
     lat, lon = np.meshgrid(
         exposure.latitude.values, exposure.longitude.values, indexing="ij"
     )
@@ -709,7 +711,7 @@ def smooth_region_weights(
     for idx in np.ndindex(lat.shape):
         region[idx] = assign_region(cfg.basin, lat[idx], lon[idx])
     fields = {
-        name: gaussian_filter(
+        f"w_{name}": gaussian_filter(
             ((region == name) & eligible).astype(float), sigma=sigma, mode="nearest"
         )
         for name in names
@@ -718,12 +720,25 @@ def smooth_region_weights(
     if np.any((total == 0) & eligible):
         raise AssertionError("Zero Gaussian weight on an eligible cell")
     total = np.where(total > 0, total, 1.0)
+    fields = {k: (v / total).astype(np.float64) for k, v in fields.items()}
+    return fields, names
+
+
+def smooth_region_weights(
+    model: pd.DataFrame, exposure: xr.Dataset, cfg: GenesisConfig, sigma: float = 3.0
+) -> tuple[pd.DataFrame, list[str]]:
+    """Join static memberships without repeating their Gaussian construction."""
+    fields, names = static_region_weights(exposure, cfg, sigma=sigma)
+    lat, lon = np.meshgrid(
+        exposure.latitude.values, exposure.longitude.values, indexing="ij"
+    )
     rows = {"latitude": lat.ravel(), "longitude": lon.ravel()}
-    for name, f in fields.items():
-        rows[f"w_{name}"] = (f / total).ravel()
-    w = pd.DataFrame(rows)
+    rows.update({key: val.ravel() for key, val in fields.items()})
     out = model.merge(
-        w, on=["latitude", "longitude"], validate="many_to_one", how="left"
+        pd.DataFrame(rows),
+        on=["latitude", "longitude"],
+        validate="many_to_one",
+        how="left",
     )
     if out.filter(regex="^w_").isna().any().any():
         raise AssertionError("Missing geographic soft weights")
@@ -736,11 +751,11 @@ def standardize_train_test(
     """Transform with training-year moments only; no holdout leakage."""
     train = table.loc[table.year < cfg.first_test_year].copy()
     test = table.loc[table.year >= cfg.first_test_year].copy()
-    if train.empty or test.empty:
-        raise AssertionError(f"{cfg.basin}: empty training or test period")
-    raw_features = (
-        ["pi", "rh600", "vws", "w500"] if cfg.basin != "EP" else ["pi", "rh600", "vws"]
-    )
+    if train.empty:
+        raise AssertionError(f"{cfg.basin}: empty training period")
+    # An empty test split is valid for a FINAL production fit on all historical years.
+    # Validation notebooks should still use a genuine chronological holdout.
+    raw_features = ["pi", "rh600", "vws"]
     train["eta_clip"] = train.eta850.clip(upper=ETA_CLIP[cfg.basin])
     test["eta_clip"] = test.eta850.clip(upper=ETA_CLIP[cfg.basin])
     raw_features.append("eta_clip")

@@ -42,7 +42,7 @@ def input_data(file):
         list(map(int, b)) for b in variables.get("months_for_coef_PRESS", mpi_bounds)
     ]
     generation_phase = variables.get("generation_phase", "NEU")
-    genesis_weighting = variables.get("genesis_weighting", "EMPIRICAL")
+    genesis_weighting = variables.get("genesis_weighting", "EMPIRICAL") # GPI-MIX, GPI or GLM
 
     return (
         period,
