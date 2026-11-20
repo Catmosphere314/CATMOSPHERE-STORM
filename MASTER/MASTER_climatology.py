@@ -51,3 +51,14 @@ if climate_index.lower() != "none":
 
     # Save individual year-month fields for interannual resampling
     climatology.save_yearly_env_fields(climate_df, period)
+
+# Genesis GLM auxiliary climate predictors (separate from env_yearly/).
+# Must follow save_yearly_env_fields, as JASO reads SST_<year>_<month>.npy.
+if genesis_weighting == "GLM":
+    from CODE.genesis_complementary import build_historical_features
+
+    selected = ["EP", "NA", "NI", "SI", "SP", "WP"]
+    needed = [selected[i] for i in idx_basin if selected[i] in ("NA", "EP", "WP", "SP")]
+    if needed:
+        build_historical_features(__location__, period=period, basins=needed)
+        print("Historical GLM complementary features saved")

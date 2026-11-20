@@ -666,6 +666,29 @@ def _run_single_member(
         dst_lons,
     )
 
+    # Complementary GLM predictors use the newly generated member SST fields.
+    # Legacy modes do not need this extra preparation.
+    from CODE.import_data import input_data as _load_input
+
+    _settings = _load_input("input.dat")
+    if _settings[-1] == "GLM":
+        from CODE.genesis_complementary import build_forecast_features
+
+        _basin_names = ["EP", "NA", "NI", "SI", "SP", "WP"]
+        _selected = [
+            _basin_names[i]
+            for i in _settings[3]
+            if _basin_names[i] in ("NA", "EP", "WP", "SP")
+        ]
+        if _selected:
+            build_forecast_features(
+                __location__,
+                init_date=init_date,
+                lead_months=lead_months,
+                env_year=env_year,
+                basins=_selected,
+            )
+
     if generate_config:
         phase_schedule = build_phase_schedule_from_seas5(
             ds_sfc,
@@ -706,7 +729,7 @@ if __name__ == "__main__":
         "--member",
         type=int,
         nargs="*",
-        default=51,
+        default=None,
         help="Member indices to process (default: all 51). E.g. --member 0 12 37",
     )
     parser.add_argument(
@@ -766,7 +789,9 @@ if __name__ == "__main__":
     # ---- Step B: Dispatch per-member processing ----
     # Workers open the already-corrected NetCDFs read-only. No download
     # happens in workers; they only extract, regrid, derive, and save.
-    jobs = [m for m in range(*args.member)]
+    jobs = list(range(51)) if args.member is None else list(args.member)
+    if not jobs or any(m < 0 or m >= 51 for m in jobs):
+        parser.error("--member requires indices from 0 to 50")
     n_workers = args.workers or min(len(jobs), mp.cpu_count())
 
     worker_fn = partial(

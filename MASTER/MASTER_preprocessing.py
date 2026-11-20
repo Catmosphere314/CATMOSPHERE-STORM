@@ -191,8 +191,13 @@ print("********************************")
 environmental.pressure_coefficients(idx_basin, months, months_for_coef_PRESS)
 print("pressure_coefficients done")
 
+
 print("********************************")
-genesis_matrix.Change_genesis_locations(idx_basin, months, genesis_weighting)
+if genesis_weighting != "GLM":
+    genesis_matrix.Change_genesis_locations(idx_basin, months, genesis_weighting)
+else:
+    print("genesis_matrix fitting using GLM weighting")
+    genesis_matrix.genesis_glm_fitting(idx_basin, months, period)
 print("genesis_matrix done")
 
 print("********************************")

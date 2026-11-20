@@ -80,21 +80,46 @@ def _run_single_job_historical(job, years_per_loop, use_yearly=True, outdir=None
     t0 = time.time()
 
     TC_data = []
-    for year in range(years_per_loop):
-        # ── ORIGINAL MODE ──
-        storms_per_year, genesis_month, lat0, lat1, lon0, lon1 = Basins_WMO(
-            basin, phase=phase
-        )
+    genesis_mode = _input[-1]
+    if genesis_mode == "GLM":
+        from CODE.SAMPLE_GENESIS_GLM import GenesisGLMSampler
 
-        # ── Draw historical years per month for this simulated year ──
-        env_years = None
-        if env_pool is not None:
-            env_years = draw_env_years_for_season(env_pool, phase, active_months)
-
-        if storms_per_year > 0:
-            lon_genesis_list, lat_genesis_list = Startingpoint(
-                storms_per_year, genesis_month, basin, phase=phase, env_years=env_years
+        glm_sampler = GenesisGLMSampler.load(basin=basin, base_dir=__location__)
+        missing_downstream = set(glm_sampler.months) - set(active_months)
+        if missing_downstream:
+            raise ValueError(
+                f"{basin} GLM can generate months {sorted(missing_downstream)} "
+                "not configured for legacy track/pressure coefficients in input.dat. "
+                "Fit downstream coefficients for these months; do not silently drop genesis."
             )
+        active_months = glm_sampler.months
+        if env_pool is None:
+            raise ValueError(
+                "GLM genesis requires --yearly ERA5 environments (no --no-yearly)"
+            )
+
+    for year in range(years_per_loop):
+        env_years = (
+            draw_env_years_for_season(env_pool, phase, active_months)
+            if env_pool is not None
+            else None
+        )
+        if genesis_mode == "GLM":
+            genesis_month, lon_genesis_list, lat_genesis_list = (
+                glm_sampler.sample_season(env_years=env_years)
+            )
+            storms_per_year = len(genesis_month)
+        else:
+            storms_per_year, genesis_month, *_ = Basins_WMO(basin, phase=phase)
+            if storms_per_year > 0:
+                lon_genesis_list, lat_genesis_list = Startingpoint(
+                    storms_per_year,
+                    genesis_month,
+                    basin,
+                    phase=phase,
+                    env_years=env_years,
+                )
+        if storms_per_year > 0:
             latlist, lonlist, landfalllist = TC_movement(
                 lon_genesis_list,
                 lat_genesis_list,
@@ -193,15 +218,36 @@ def _run_single_job_forecast(
     month_phases = get_month_phases(forecast_cfg, active_months)
     member_num = forecast_cfg.get("ensemble_member", 0)
 
-    # Load phase-specific genesis parameters
-    poisson_phase_rate = np.load(
-        os.path.join(__location__, "POISSON_GENESIS_PARAMETERS_PHASE.npy"),
-        allow_pickle=True,
-    ).item()
-    genesis_months_phase = np.load(
-        os.path.join(__location__, "GENESIS_MONTHS_PHASE.npy"),
-        allow_pickle=True,
-    ).item()
+    genesis_mode = _input[-1]
+    if genesis_mode == "GLM":
+        from CODE.SAMPLE_GENESIS_GLM import GenesisGLMSampler
+
+        glm_sampler = GenesisGLMSampler.load(basin=basin, base_dir=__location__)
+        missing_downstream = set(glm_sampler.months) - set(active_months)
+        if missing_downstream:
+            raise ValueError(
+                f"{basin} GLM can generate months {sorted(missing_downstream)} "
+                "not configured for legacy track/pressure coefficients in input.dat. "
+                "Fit downstream coefficients for these months; do not silently drop genesis."
+            )
+        active_months = glm_sampler.months
+        # Recompute phase mapping using the fitted GLM's month set.
+        month_phases = get_month_phases(forecast_cfg, active_months)
+        # A forward forecast should not generate storms in months already observed.
+        future_active_months = [
+            m
+            for m in active_months
+            if forecast_cfg["months"].get(str(m), {}).get("source") != "observed"
+        ]
+    else:
+        poisson_phase_rate = np.load(
+            os.path.join(__location__, "POISSON_GENESIS_PARAMETERS_PHASE.npy"),
+            allow_pickle=True,
+        ).item()
+        genesis_months_phase = np.load(
+            os.path.join(__location__, "GENESIS_MONTHS_PHASE.npy"),
+            allow_pickle=True,
+        ).item()
 
     pid = os.getpid()
     print(
@@ -214,30 +260,44 @@ def _run_single_job_forecast(
     TC_data = []
     for year in range(years_per_loop):
         # ── FORECAST MODE ──
-        # Blended genesis: single Poisson + multinomial across months
-        storms_per_year, genesis_month, lat0, lat1, lon0, lon1 = Basins_WMO_forecast(
-            basin,
-            month_phases,
-            poisson_phase_rate=poisson_phase_rate,
-            genesis_months_phase=genesis_months_phase,
-            active_months=active_months,
-        )
-
-        # Build env_years from forecast config
-        # "historical" months get a fresh resample each synthetic year
+        # The same environmental mapping must be passed
+        # to genesis, movement and intensity.
         env_years = build_forecast_env_years(
             forecast_cfg, env_pool or {}, active_months
         )
 
-        if storms_per_year > 0:
-            lon_genesis_list, lat_genesis_list = Startingpoint(
-                storms_per_year,
-                genesis_month,
-                basin,
-                phase=phase,
-                month_phases=month_phases,
-                env_years=env_years,
+        if genesis_mode == "GLM":
+            # New API to implement, not an existing function.
+            genesis_month, lon_genesis_list, lat_genesis_list = (
+                glm_sampler.sample_season(
+                    env_years=env_years,
+                    forecast_cfg=forecast_cfg,
+                    months=future_active_months,
+                )
             )
+
+            storms_per_year = len(genesis_month)
+
+        else:
+            storms_per_year, genesis_month, *_ = Basins_WMO_forecast(
+                basin,
+                month_phases,
+                poisson_phase_rate=poisson_phase_rate,
+                genesis_months_phase=genesis_months_phase,
+                active_months=active_months,
+            )
+
+            if storms_per_year > 0:
+                lon_genesis_list, lat_genesis_list = Startingpoint(
+                    storms_per_year,
+                    genesis_month,
+                    basin,
+                    phase=phase,
+                    month_phases=month_phases,
+                    env_years=env_years,
+                )
+
+        if storms_per_year > 0:
             latlist, lonlist, landfalllist = TC_movement(
                 lon_genesis_list,
                 lat_genesis_list,
