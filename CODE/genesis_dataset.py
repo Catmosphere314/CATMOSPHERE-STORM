@@ -117,8 +117,12 @@ def _load_dict(folder: Path, filename: str) -> dict:
     return obj
 
 
-def load_first_ts_genesis(data_root: Path) -> pd.DataFrame:
+def load_first_ts_genesis(data_root: Path, basins: list = None) -> pd.DataFrame:
     """One row per retained storm, indexed by original IBTrACS storm position.
+
+    Args:
+        data_root: Path to the folder containing the preprocessed TC dictionaries.
+        basins: Optional list of basin names to filter the output. If None, all basins are included.
 
     Use TIMELIST_INTERP as numerical MJD days and BASINLIST_INTERP as the basin
     at the first TS-threshold crossing. YEARLIST_INTERP is IBTrACS `season` and
@@ -145,6 +149,8 @@ def load_first_ts_genesis(data_root: Path) -> pd.DataFrame:
             name = INDEX_TO_BASIN.get(int(raw_basin))
         else:
             name = str(raw_basin).upper()
+        if (basins is not None) and (name not in basins):
+            continue  # Skip basins not requested by the caller 
         if name not in BASINS:
             raise ValueError(f"Storm {sid}: unknown genesis basin {raw_basin!r}")
         mjd = float(times[sid][0])
@@ -398,9 +404,6 @@ def audit_genesis(
 def load_basin_environment(
     env_dir: Path,
     cfg: GenesisConfig,
-    *,
-    include_w500: bool,
-    w500_file: Path | None = None,
 ) -> xr.Dataset:
     """Load small 1-degree *basin* samples from monthly 0.25-degree memmaps.
 
@@ -442,10 +445,6 @@ def load_basin_environment(
     hemisphere = 1.0 if cfg.basin in ("NA", "WP", "EP", "NI") else -1.0
     ds["eta850"] = (hemisphere * (ds["vort850"] + f)).clip(min=0)
     ds = ds.drop_vars("vort850")
-    if include_w500:
-        if w500_file is None:
-            raise ValueError(f"Basin {cfg.basin} needs W500; supply w500_file")
-        ds["w500"] = load_basin_w500(w500_file, dates, lats, lons)
     return ds
 
 
@@ -585,7 +584,7 @@ def build_model_table(
     unobserved cells are audited and dropped; their potential exposure is not
     silently treated as observed absence. No event is replicated or lost.
     """
-    fields = ["pi", "rh600", "vws", "eta850"] + (["w500"] if cfg.basin != "EP" else [])
+    fields = ["pi", "rh600", "vws", "eta850"] 
     missing_fields = sorted(set(fields) - set(env.data_vars))
     if missing_fields:
         raise KeyError(f"{cfg.basin}: missing {missing_fields}")
@@ -810,7 +809,7 @@ def _crop_sst(
 
 
 def yearly_relative_sst(env_dir: Path, cfg: GenesisConfig) -> pd.DataFrame:
-    """NA / EP retained JJASON indices from original basin notebooks.
+    """NA / EP retained JASO indices from original basin notebooks.
 
     rsst = MDR mean - tropical mean
     rsst_bis = MDR mean - area-weighted warmest-30%-of-tropics mean.
@@ -824,7 +823,7 @@ def yearly_relative_sst(env_dir: Path, cfg: GenesisConfig) -> pd.DataFrame:
     lat = np.linspace(90.0, -90.0, 721)
     lon = np.arange(1440) * 0.25
     for year in range(cfg.start_year, cfg.end_year + 1):
-        for month in (6, 7, 8, 9, 10, 11):
+        for month in (7, 8, 9, 10):
             path = Path(env_dir) / f"SST_{year}_{month}.npy"
             if not path.is_file():
                 raise FileNotFoundError(f"Missing SST month {path}")

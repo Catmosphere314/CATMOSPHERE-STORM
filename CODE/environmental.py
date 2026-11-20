@@ -872,6 +872,7 @@ def _select_lambda_pressure_cv(df_basin, lambda_grid=None, min_fold_size=20):
     )
     return best_lambda, cv_results
 
+BASIN_NAMES = ["EP", "NA", "NI", "SI", "SP", "WP"]
 
 def pressure_coefficients(idx_basin, months, months_for_coef, lambda_phase=None):
     """
@@ -900,7 +901,7 @@ def pressure_coefficients(idx_basin, months, months_for_coef, lambda_phase=None)
     ).item()
 
     coeflist = {i: [] for i in range(0, 6)}
-    basin_names = ["EP", "NA", "NI", "SI", "SP", "WP"]
+    basin_names = BASIN_NAMES
     lambda_report = {}
 
     for ii in range(len(idx_basin)):

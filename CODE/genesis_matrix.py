@@ -814,3 +814,230 @@ def compute_gpi_field(basin, month, phase=None, env_year=None):
         return None
 
     return gpi / s
+
+
+
+
+
+##################################################
+# ####   GLM    FITTING   ####
+##################################################
+from CODE import genesis_dataset as gd
+from pathlib import Path
+
+
+START_YEAR = int(os.environ.get("STORM_GENESIS_FIRST_YEAR", "1980"))
+END_YEAR = int(os.environ.get("STORM_GENESIS_LAST_YEAR", "2025"))
+
+from CODE.environmental import BASIN_NAMES
+from CODE import genesis_matrix as gm
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+
+def _formula_for_basin(basin: str, soft_regions: dict) -> str:
+    terms = [f"w_{r}" for r in soft_regions[basin] if r != gd.REGION_REFERENCE[basin]]
+    if basin == "NA":
+        return (
+            "genesis_count ~ C(month) + z_pi + z_rh600 + z_vws + z_eta_clip "
+            + (" + " + " + ".join(terms) if terms else "")
+            + " + rsst"
+        )
+    if basin == "WP":
+        return (
+            "genesis_count ~ z_pi + z_rh600 + z_vws + z_eta_clip +"
+            + (" + " + " + ".join(terms) if terms else "")
+            + " + z_eio_dynamic"
+        )
+    if basin == "EP":
+        return "genesis_count ~ z_pi + z_rh600 + z_vws + z_eta_clip + rsst_bis" + (
+            " + " + " + ".join(terms) if terms else ""
+        )
+    if basin == "NI":
+        return "genesis_count ~ C(ni_season) + C(region) + z_eta_clip + z_vws + z_rh600 + z_pi"
+    if basin == "SI":
+        return "genesis_count ~ z_pi + z_rh600 + z_vws + z_eta_clip " + (
+            " + " + " + ".join(terms) if terms else ""
+        )
+    if basin == "SP":
+        return (
+            "genesis_count ~ z_pi:w_central_south_pacific + z_pi:w_eastern_south_pacific"
+            " + z_vws + z_eta_clip + w_eastern_south_pacific + z_pi"
+            " + roni_ond_standardized:w_eastern_south_pacific"
+        )
+    raise ValueError(basin)
+
+
+from pathlib import Path
+import statsmodels.api as sm
+import joblib
+
+def genesis_glm_fitting(idx_basin, months,*,period: tuple, save_prepared : bool = True) -> None:
+    """
+    Fit a Poisson regression model for each basin using the preprocessed data.
+
+    Parameters
+    ----------
+    idx_basin : list of int
+        Indices of basins to process (0=EP, 1=NA, 2=NI, 3=SI, 4=SP, 5=WP).
+    months : list of list of int
+        List of months for each basin to include in the model fitting.
+    save_prepared : bool, optional
+        If True, save the fitted models and related data to disk for later use in sampling.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the fitted models, training and testing datasets,
+        scalers, and soft region weights for each basin.
+
+
+    Notes
+    -------
+        Save the fitted models and related data to disk for later use in the sampling
+    """
+
+    basins = [BASIN_NAMES[i] for i in idx_basin]
+
+    config_basins = {
+        b: gd.GenesisConfig(
+            basin=b,
+            start_year=period[0],
+            end_year=period[1],
+            first_test_year=period[1],
+        )
+        for b in basins
+    }
+
+    genesis_all = gd.load_first_ts_genesis(Path(__location__), basins)
+    coarse_exposure = {basin: gd.build_osm_exposure(basin) for basin in basins}
+
+
+    # Genesis boundaries are narrower than full storm/track boundaries by design.
+    # Never compare against gm._genesis_ocean_mask_1deg(basin, shape): it uses
+    # BOUNDARIES_BASINS (track bounds), so those grid rows represent other latitudes.
+
+
+    for basin, ex in coarse_exposure.items():
+        assert ex.attrs["coarse_max_land_fraction"] == gd.MAX_GENESIS_COARSE_LAND_FRAC
+        assert ex.attrs["genesis_bounds"] == list(config_basins[basin].bounds)
+        assert ex.eligible_area_km2.min().item() >= 0
+        assert not bool((ex.eligible_fraction > ex.raw_ocean_fraction + 1e-5).any())
+        print(
+            f"{basin}: {ex.sizes['latitude']}x{ex.sizes['longitude']}; "
+            f"{int(ex.ocean_valid.sum())} valid cells; "
+            f"{ex.eligible_area_km2.sum().item():,.0f} eligible km²; "
+            f"OSM SHA {ex.attrs['osm_sha256'][:12]}"
+        )
+
+    event_audit, genesis = gd.audit_genesis(genesis_all, coarse_exposure, config_basins)
+
+    env_1deg = {}
+    for basin, cfg in config_basins.items():
+        print("Loading", basin, "...", flush=True)
+        env_1deg[basin] = gd.load_basin_environment(
+            os.path.join(__location__,"env_yearly"),
+            cfg,
+        )
+
+    climate_extra = {b: None for b in basins}
+    for basin in ("NA", "EP"):
+        if basin in basins:
+            yearly_sst = gd.yearly_relative_sst(os.path.join(__location__,"env_yearly"), config_basins[basin])
+            climate_extra[basin] = gd.na_ep_climate_monthly(yearly_sst, config_basins[basin])
+    if "WP" in basins:
+        climate_extra["WP"] = gd.wp_eio_dynamic(os.path.join(__location__,"Monthly_mean_SST.nc"), config_basins["WP"])
+    if "SP" in basins:
+        climate_extra["SP"] = gd.sp_roni_monthly(os.path.join(__location__,"roni.csv"), config_basins["SP"])
+
+
+    model_df = {}
+    for basin, cfg in config_basins.items():
+        df = gd.build_model_table(
+            env_1deg[basin],
+            coarse_exposure[basin],
+            genesis[basin],
+            cfg,
+            extra=climate_extra[basin],
+        )
+        model_df[basin] = df
+
+    train, test, scalers, soft_regions = {}, {}, {}, {}
+    for basin, cfg in config_basins.items():
+        df = model_df[basin]
+        if basin in ("NA", "WP", "EP", "SI", "SP"):
+            df, soft_regions[basin] = gd.smooth_region_weights(
+                df, coarse_exposure[basin], cfg, sigma=3.0
+            )
+        else:
+            soft_regions[basin] = []
+        model_df[basin] = df
+        train[basin], test[basin], scalers[basin] = gd.standardize_train_test(df, cfg)
+
+
+    formulas = {basin: _formula_for_basin(basin, soft_regions) for basin in basins}
+    for basin, form in formulas.items():
+        print(basin, "->", form)
+
+
+    models = {}
+    for basin in basins:
+        models[basin] = smf.glm(
+            formula=formulas[basin],
+            data=train[basin],
+            family=sm.families.Poisson(),
+            offset=train[basin].log_exposure,
+        ).fit()
+
+
+    if save_prepared:
+        target = Path(__location__) / "genesis_prepared"
+        target.mkdir(exist_ok=True)
+        # for b in basins:
+        #     models[b].save(target / f"model_{b}.pkl")
+        #     coarse_exposure[b].to_netcdf(target / f"osm_genesis_exposure_{b}_1deg.nc")
+        #     np.save(target / f'scalers_{b}.npy',  scalers[b])
+
+        for basin in basins:
+            models[basin].save(target / f"glm_{basin}.pkl")
+
+            joblib.dump(
+                {
+                    "scalers": scalers[basin],
+                    "formula": formulas[basin],
+                    "active_months": list(config_basins[basin].active_months),
+                    "genesis_bounds": list(config_basins[basin].bounds),
+                    "eta_clip": gd.ETA_CLIP[basin],
+                    "region_sigma": 3.0,
+                },
+                target / f"metadata_{basin}.joblib",
+            )
+
+            coarse_exposure[basin].to_netcdf(target / f"osm_genesis_exposure_{basin}_1deg.nc")
+
+        print("Saved:", target)
+
+
+
+
+target = Path(__location__) / "genesis_prepared"
+target.mkdir(parents=True, exist_ok=True)
+
+
+from typing import Any
+
+def _load_model_scalers(basin : str = "NA") -> tuple[Any, dict]:
+    """Load the previously fitted basin specific model."""
+    target = Path(__location__) / "genesis_prepared"
+    model = sm.load(target / f"model_{basin}.pkl")
+    scalers = np.load(target / f"scalers_{basin}.npy",allow_pickle='TRUE').item()
+    return model, scalers
+
+
+def _rescale_data(df: pd.DataFrame, scalers : dict) -> pd.DataFrame:
+    """Rescale the data according to the training scaler."""
+    scaled_df = df.copy()
+    for i in scalers.keys():
+        scaled_df["z_" + i] = (scaled_df[i] - scalers[i][0])/scalers[i][1]
+    return scaled_df
+
